@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 from sklearn.datasets import fetch_openml
 from tqdm import tqdm
 import logging
@@ -62,48 +63,75 @@ DATASETS_REG = {
 }
 
 
-def determine_task_type(dataset):
+def determine_task_type(dataset) -> str:
     """
     Determine if an OpenML dataset is for classification or regression.
 
-    Parameters
-    ----------
-    dataset_name : str, optional
-        Name of the OpenML dataset
-    data_id : int, optional
-        OpenML dataset ID
-
-    Returns
-    -------
-    str : 'classification', 'regression', or 'unknown'
+    Rules
+    -----
+    - Categorical or object target → 'classification'
+    - Numeric target:
+        * Treat as 'classification' only if ALL are integer-like, the unique
+          labels are consecutive (no gaps), and the minimum label is 0 or 1:
+              - #classes in [2, 20] → 'classification'
+              - Special-case: exactly {0..20} (21 classes) → 'classification'
+        * Otherwise → 'regression'
+    - Fallback → 'unknown'
     """
-
     logger = logging.getLogger(__name__)
-    target = dataset.target
-    logger.debug(
-        f"Determining task type for target with dtype: {getattr(target, 'dtype', None)}"
-    )
-    # Method 1: Check target data type
-    if hasattr(target, "dtype"):
-        if target.dtype == "object" or target.dtype.name == "category":
-            logger.info("Task type determined: classification")
-            return "classification"
-        elif np.issubdtype(target.dtype, np.floating):
-            logger.info("Task type determined: regression")
+    target = getattr(dataset, "target", None)
+    if target is None:
+        logger.warning("No target found on dataset; returning 'unknown'.")
+        return "unknown"
+
+    s = pd.Series(target).dropna()
+    logger.debug(f"Determining task type for target with dtype: {getattr(s, 'dtype', None)}")
+
+    if s.empty:
+        logger.warning("Target is empty after dropping NaNs; returning 'unknown'.")
+        return "unknown"
+
+    # 1) Categorical or object → classification
+    if pd.api.types.is_categorical_dtype(s.dtype) or pd.api.types.is_object_dtype(s.dtype):
+        logger.info("Task type determined: classification (categorical/object)")
+        return "classification"
+
+    # 2) Numeric path
+    if pd.api.types.is_numeric_dtype(s.dtype):
+        arr = s.to_numpy()
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            logger.info("Task type determined: regression (numeric but no finite values)")
             return "regression"
-        elif np.issubdtype(target.dtype, np.integer):
-            # For integers, check uniqueness ratio
-            unique_values = len(np.unique(target))
-            total_values = len(target)
-            logger.debug(f"Unique/total values ratio: {unique_values}/{total_values}")
-            if unique_values / total_values < 0.1:
-                logger.info("Task type determined: classification (integer)")
+
+        # Integer-like check (allow float storage of ints)
+        integer_like = np.all(np.isclose(arr, np.round(arr), atol=1e-12))
+        if integer_like:
+            vals = np.unique(np.round(arr).astype(int))
+            k = vals.size
+            vmin, vmax = int(vals.min()), int(vals.max())
+
+            consecutive = np.array_equal(vals, np.arange(vmin, vmax + 1))
+            starts_ok = vmin in (0, 1)
+            dense_0_to_20 = (vmin == 0 and vmax == 20 and consecutive)  # special-case
+
+            logger.debug(
+                f"integer_like={integer_like}, k={k}, vmin={vmin}, vmax={vmax}, "
+                f"consecutive={consecutive}, starts_ok={starts_ok}"
+            )
+
+            if consecutive and starts_ok and ((2 <= k <= 20) or dense_0_to_20):
+                logger.info("Task type determined: classification (integer, consecutive, start 0/1)")
                 return "classification"
-            else:
-                logger.info("Task type determined: regression (integer)")
-                return "regression"
+
+        # Anything else numeric → regression
+        logger.info("Task type determined: regression (numeric)")
+        return "regression"
+
+    # 3) Fallback
     logger.warning("Task type could not be determined, returning 'unknown'.")
     return "unknown"
+
 
 
 def fetch_single_dataset_openml(

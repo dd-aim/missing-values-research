@@ -296,39 +296,60 @@ class MissingEstimator(BaseEstimator):
         return X, y
 
     @staticmethod
-    def _get_task_type_of_data(y: np.ndarray) -> str:
+    def _get_task_type_of_data(y: np.ndarray | pd.Series) -> str:
         """
-        Helper method to check the given label's task type (classification/multi-class/regression).
-
-        Returns:
-            str: Task type string
+        Decide between 'binary_classification', 'multi_class_classification', 'regression'
+        under these numeric rules:
+        • For numeric labels: must be integer-like, consecutive, and start at 0 or 1.
+            - {0,1} or {1,2}                → binary_classification
+            - {0..K} or {1..K} (no gaps)    → multi_class_classification if 3 ≤ #classes ≤ 20
+        • Special-case: {0..20} (21 classes) → multi_class_classification
+        • Any gaps (e.g., {0,4,5,6}) → regression
+        • Categorical dtype → classification based on number of categories.
+        • Otherwise → regression.
         """
+        s = pd.Series(y).dropna()
+        if s.empty:
+            return "regression"
 
-        if pd.api.types.is_numeric_dtype(y):
-            # Check if it's actually discrete values (classification) or continuous (regression)
-            unique_vals = np.unique(y)
-            if len(unique_vals) <= 20 and np.all(np.equal(np.mod(y, 1), 0)):
-                # Discrete integer values, likely classification
-                if len(unique_vals) == 2:
-                    return "binary_classification"
-                else:
-                    return "multi_class_classification"
-            else:
+        # 1) Categorical labels: trust categories
+        if pd.api.types.is_categorical_dtype(s.dtype):
+            k = len(s.dtype.categories)
+            if k == 2:
+                return "binary_classification"
+            return "multi_class_classification" if k >= 3 else "regression"
+
+        # 2) Numeric labels
+        if pd.api.types.is_numeric_dtype(s.dtype):
+            arr = s.to_numpy()
+            arr = arr[np.isfinite(arr)]
+            if arr.size == 0:
                 return "regression"
 
-        elif pd.api.types.is_categorical_dtype(y):
-            num_classes = len(y.dtype.categories)
+            # Integer-like check (allow float storage of ints)
+            if np.all(np.isclose(arr, np.round(arr), atol=1e-12)):
+                vals = np.unique(np.round(arr).astype(int))
+                k = vals.size
+                vmin, vmax = int(vals.min()), int(vals.max())
 
-            if num_classes == 2:
-                return "binary_classification"
-            elif num_classes > 2:
-                return "multi_class_classification"
+                consecutive = np.array_equal(vals, np.arange(vmin, vmax + 1))
+                starts_ok = vmin in (0, 1)
 
-        raise ValueError(
-            "Task type could not be determined. "
-            "Please ensure that the labels are either numeric or categorical using the correct dtype with pandas."
-            "Example: if its categorical, use pd.Categorical to convert the labels or .astype('category')."
-        )
+                # Special-case dense 0..20 inclusive (21 classes)
+                dense_0_to_20 = (vmin == 0 and vmax == 20 and consecutive)
+
+                if consecutive and starts_ok:
+                    if k == 2:
+                        return "binary_classification"
+                    if 3 <= k <= 20 or dense_0_to_20:
+                        return "multi_class_classification"
+
+            # Not integer-like, or gaps, or wrong start
+            return "regression"
+
+        # 3) Fallback
+        return "regression"
+
 
     # --------------------------------------------------------------------- #
     # Scikit-learn API
@@ -349,12 +370,16 @@ class MissingEstimator(BaseEstimator):
                 self.output_activation = "linear"
 
             task = self._get_task_type_of_data(y)
+            logging.info(f"Determined task type: {task}")
             if task == "binary_classification":
                 self.output_activation = "sigmoid"
+                logging.info("Setting output activation to 'sigmoid' for binary classification.")
             elif task == "regression":
                 self.output_activation = "linear"
+                logging.info("Setting output activation to 'linear' for regression.")
             elif task == "multi_class_classification":
                 self.output_activation = "softmax"
+                logging.info("Setting output activation to 'softmax' for multi-class classification.")
 
         # Decide whether to split validation first
         if self.early_stopping and 0.0 < self.early_stopping < 1.0:

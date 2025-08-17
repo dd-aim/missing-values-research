@@ -116,9 +116,8 @@ def transform_data(
         # Process each date column
         for col in date_categorical_cols:
             # Optionally encode date columns here
-            logger.debug(f"Dropping date column: {col}")
-            train_X = train_X.drop(columns=col)
-            test_X = test_X.drop(columns=col)
+            train_X = _encode_date_column(col, train_X)
+            test_X = _encode_date_column(col, test_X)
 
     # one-hot (dense so we can wrap in a DataFrame)
     if categorical_cols:
@@ -232,7 +231,7 @@ if __name__ == "__main__":
                 est.fit(X_train_aug, y_train_aug)
                 sc = est.score(X_test_proc, y_test)
                 append_score(stats, task, sc)
-                
+
                 # ────────────────── summary for this imputer ──────────────────
                 if task == "classification":
                     logger.info(f"      accuracy : {pretty_stats(stats['acc'])}")
