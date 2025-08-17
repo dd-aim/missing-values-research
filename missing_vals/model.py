@@ -91,19 +91,31 @@ class _Net(nn.Module):
         x = self.hidden(x)
         if torch.isnan(x).any():
             self.logger.warning("Hidden layer output contains NaNs!")
+            raise ValueError(
+                "Hidden layer output contains NaNs, which may cause the output layer to return NaNs"
+            )
         if self.act is not None:
             x = self.act(x)
         self.logger.debug(f"Net forward: After activation, tensor shape: {x.shape}")
         if torch.isnan(x).any():
             self.logger.warning("Activation output contains NaNs!")
+            raise ValueError(
+                "Activation output contains NaNs, which may cause the output layer to return NaNs"
+            )
         out = self.out(x)
         if torch.isnan(out).any():
             self.logger.warning("Output tensor contains NaNs!")
+            raise ValueError(
+                "Output tensor contains NaNs, which may cause the final output to return NaNs"
+            )
         if self.out_act is None:
             return out
         out = self.out_act(out)
         if torch.isnan(out).any():
             self.logger.warning("Output tensor contains NaNs after activation!")
+            raise ValueError(
+                "Output tensor contains NaNs after activation, which may cause the final output to return NaNs"
+            )
         return out
 
 
@@ -478,6 +490,13 @@ class MissingEstimator(BaseEstimator):
                 xb, yb = xb.to(device), yb.to(device)
                 optimiser.zero_grad()
                 preds = self._model_(xb)
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    with open(f"last_train_batch.json", "w") as f:
+                        json.dump({
+                            "xb": xb.cpu().numpy().tolist(),
+                            "yb": yb.cpu().numpy().tolist(),
+                            "preds": preds.cpu().detach().numpy().tolist()
+                        }, f)
                 loss = criterion(preds, yb)
                 loss.backward()
                 optimiser.step()

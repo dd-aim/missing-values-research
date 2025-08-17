@@ -17,12 +17,13 @@ from missing_vals.openml import (
 )
 from missing_vals.utils import augment_with_missing_values
 from missing_vals.model import MissingEstimator
+import json
 
 # --------------------------------------------------------------------------- #
 # Logging setup
 # --------------------------------------------------------------------------- #
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
@@ -169,7 +170,7 @@ def pretty_stats(values: list[float]) -> str:
 # main
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
-    all_datasets = {**DATASETS_CLS, **DATASETS_REG}
+    all_datasets = {**DATASETS_REG, **DATASETS_CLS}
 
     logger.info("▼ Downloading OpenML datasets (this is cached on first run)…")
     datasets = fetch_datasets_openml(
@@ -187,7 +188,7 @@ if __name__ == "__main__":
         task = determine_task_type(ds)  # 'classification' / 'regression'
         y = ds.target.copy(deep=True)
         X = ds.frame.drop(columns=y.name)
-
+        error_datasets = []
         if task == "classification" and not pd.api.types.is_numeric_dtype(y):
             logger.debug(
                 "Converting target to categorical codes for classification task."
@@ -199,7 +200,8 @@ if __name__ == "__main__":
 
             stats = {"acc": [], "auc": [], "r2": []}
 
-            for split_seed in tqdm(range(5), leave=False):
+            # for split_seed in tqdm(range(5), leave=False):
+            for split_seed in tqdm(range(1), leave=False):
                 logger.debug(f"Split seed: {split_seed}")
                 # 50 % hold-out split
                 train_idx = X.sample(frac=0.5, random_state=split_seed).index
@@ -230,10 +232,11 @@ if __name__ == "__main__":
                 est.fit(X_train_aug, y_train_aug)
                 sc = est.score(X_test_proc, y_test)
                 append_score(stats, task, sc)
-
-            # ────────────────── summary for this imputer ──────────────────
-            if task == "classification":
-                logger.info(f"      accuracy : {pretty_stats(stats['acc'])}")
-                logger.info(f"      ROC-AUC  : {pretty_stats(stats['auc'])}")
-            else:
-                logger.info(f"      R² score : {pretty_stats(stats['r2'])}")
+                
+                # ────────────────── summary for this imputer ──────────────────
+                if task == "classification":
+                    logger.info(f"      accuracy : {pretty_stats(stats['acc'])}")
+                    logger.info(f"      ROC-AUC  : {pretty_stats(stats['auc'])}")
+                else:
+                    logger.info(f"      R² score : {pretty_stats(stats['r2'])}")
+        
