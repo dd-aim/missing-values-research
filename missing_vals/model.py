@@ -34,6 +34,7 @@ from .utils import set_seed, augment_with_missing_values
 from .promissing import PromissingLinear, mPromissingLinear
 from .compass_net import COMPASSNet
 import json
+import logging
 
 
 def _get_activation(name: str) -> nn.Module:
@@ -67,33 +68,42 @@ class _Net(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden = nn.Linear(input_dim, hidden_dims[0])
-        print(f"Input dimension: {input_dim}, Hidden dimensions: {hidden_dims}")
+        self.logger = logging.getLogger(__name__)
+        self.logger.debug(
+            f"Net init: Input dimension: {input_dim}, Hidden dimensions: {hidden_dims}"
+        )
         self.act = _get_activation(activation)
-        
+
         self.out = nn.Linear(hidden_dims[0], output_dim)
         self.out_act = _get_activation(output_activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        print(f"Input tensor shape: {x.shape}")
-        print(f"Activation function: {self.act}")
-        # Check for NaNs or infinite values in the input tensor
+        self.logger.debug(f"Net forward: Input tensor shape: {x.shape}")
+        self.logger.debug(f"Net forward: Activation function: {self.act}")
         if torch.isnan(x).any() or torch.isinf(x).any():
-            raise ValueError("Input tensor contains NaNs or infinite values, which may cause the hidden layer to return NaNs")
-        with open("input_tensor.json", "w") as f:
-            json.dump(x.cpu().numpy().tolist(), f)
+            self.logger.warning("Input tensor contains NaNs or infinite values!")
+            raise ValueError(
+                "Input tensor contains NaNs or infinite values, which may cause the hidden layer to return NaNs"
+            )
+        if self.logger.isEnabledFor(logging.DEBUG):
+            with open("input_tensor.json", "w") as f:
+                json.dump(x.cpu().numpy().tolist(), f)
         x = self.hidden(x)
-        assert not torch.isnan(x).any(), "Hidden layer output contains NaNs"
+        if torch.isnan(x).any():
+            self.logger.warning("Hidden layer output contains NaNs!")
         if self.act is not None:
             x = self.act(x)
-        print(f"After activation, tensor shape: {x.shape}")
-        assert not torch.isnan(x).any(), "Activation output contains NaNs"
-        assert not torch.isnan(x).any(), "Hidden layer output contains NaNs"
+        self.logger.debug(f"Net forward: After activation, tensor shape: {x.shape}")
+        if torch.isnan(x).any():
+            self.logger.warning("Activation output contains NaNs!")
         out = self.out(x)
-        assert not torch.isnan(out).any(), "Output tensor contains NaNs"
+        if torch.isnan(out).any():
+            self.logger.warning("Output tensor contains NaNs!")
         if self.out_act is None:
             return out
         out = self.out_act(out)
-        assert not torch.isnan(out).any(), "Output tensor contains NaNs after activation"
+        if torch.isnan(out).any():
+            self.logger.warning("Output tensor contains NaNs after activation!")
         return out
 
 
@@ -222,6 +232,7 @@ class MissingEstimator(BaseEstimator):
         self.imputer_name = imputer_name
         self.imputer = self._get_imputer()
         self.custom_model = custom_model
+        self.logger = logging.getLogger(__name__)
 
     # --------------------------------------------------------------------- #
     # Internal helpers
@@ -256,7 +267,7 @@ class MissingEstimator(BaseEstimator):
             X, y = check_X_y(X, y, ensure_all_finite=True)
 
         # Format labels based on task type
-        if hasattr(self, 'output_activation'):
+        if hasattr(self, "output_activation"):
             if self.output_activation == "sigmoid":
                 # Binary classification: keep as (n_samples, 1) for BCELoss
                 y = y.astype(np.float32).reshape(-1, 1)
@@ -269,7 +280,7 @@ class MissingEstimator(BaseEstimator):
         else:
             # Default behavior during initialization
             y = y.astype(np.float32).reshape(-1, 1)
-            
+
         return X, y
 
     @staticmethod
@@ -351,7 +362,9 @@ class MissingEstimator(BaseEstimator):
                 X_train, y_train = X[n_val:], y[n_val:]
             has_val = True
             if self.verbose:
-                print(f"Early-stopping enabled: {n_val} samples for validation.")
+                self.logger.info(
+                    f"Early-stopping enabled: {n_val} samples for validation."
+                )
         else:
             X_train, y_train = X, y
             has_val = False
@@ -408,14 +421,14 @@ class MissingEstimator(BaseEstimator):
             criterion = nn.CrossEntropyLoss()
         else:  # linear/regression
             criterion = nn.MSELoss()
-            
+
         optimiser = optim.SGD(self._model_.parameters(), lr=self.lr)
 
         # Check and convert input data
         X_train, y_train = self._check_X_y(X_train, y_train)
         if has_val:
             X_val, y_val = self._check_X_y(X_val, y_val)
-        
+
         # Store original labels for classes_ attribute (before tensor conversion)
         if self.output_activation == "softmax":
             self._unique_classes = np.unique(y_train).astype(int)
@@ -471,7 +484,7 @@ class MissingEstimator(BaseEstimator):
                 epoch_loss += loss.item() * len(xb)
 
             if self.verbose:
-                print(
+                self.logger.info(
                     f"Epoch {epoch+1:03d}, train loss = {epoch_loss/len(train_ds):.4f}"
                 )
 
@@ -479,7 +492,7 @@ class MissingEstimator(BaseEstimator):
             if has_val:
                 val_loss = self._evaluate_loss(val_loader, criterion, device)
                 if self.verbose:
-                    print(f"            val   loss = {val_loss:.4f}")
+                    self.logger.info(f"            val   loss = {val_loss:.4f}")
                 # Check improvement
                 if val_loss < best_val_loss - 1e-6:
                     best_val_loss = val_loss
@@ -489,7 +502,7 @@ class MissingEstimator(BaseEstimator):
                     epochs_no_improve += 1
                     if epochs_no_improve >= self.patience:
                         if self.verbose:
-                            print(
+                            self.logger.info(
                                 f"Early stopping triggered after {epoch+1} epochs. "
                                 f"Best val loss: {best_val_loss:.4f}"
                             )
@@ -503,7 +516,7 @@ class MissingEstimator(BaseEstimator):
         if self.output_activation in ["sigmoid", "softmax"]:
             self.classes_ = self._unique_classes
         # No classes_ attribute for regression
-        
+
         self.n_features_in_ = X.shape[1]
         return self
 
@@ -645,7 +658,7 @@ class MissingEstimator(BaseEstimator):
             # Get predictions and probabilities
             y_pred = self.predict(X)
             y_proba = self.predict_proba(X)[:, 1]  # Probability of positive class
-    
+
             scores = {
                 "accuracy": accuracy_score(y, y_pred),
                 "precision": precision_score(
@@ -677,7 +690,7 @@ class MissingEstimator(BaseEstimator):
 
         else:  # regression
             y_pred = self.predict(X)
-            print(y_pred)
+            self.logger.debug(f"Regression predictions: {y_pred}")
             scores = {
                 "r2": r2_score(y, y_pred),
                 "mse": mean_squared_error(y, y_pred),

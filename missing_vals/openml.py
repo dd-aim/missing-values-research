@@ -1,6 +1,7 @@
 import numpy as np
 from sklearn.datasets import fetch_openml
 from tqdm import tqdm
+import logging
 
 DATASETS_CLS = {
     "space-ga": 737,
@@ -60,43 +61,55 @@ DATASETS_REG = {
     # "auml-url-2": 42669, # Not available in OpenML
 }
 
+
 def determine_task_type(dataset):
     """
     Determine if an OpenML dataset is for classification or regression.
-    
+
     Parameters
     ----------
     dataset_name : str, optional
         Name of the OpenML dataset
     data_id : int, optional
         OpenML dataset ID
-        
+
     Returns
     -------
     str : 'classification', 'regression', or 'unknown'
     """
-    
+
+    logger = logging.getLogger(__name__)
     target = dataset.target
-    
+    logger.debug(
+        f"Determining task type for target with dtype: {getattr(target, 'dtype', None)}"
+    )
     # Method 1: Check target data type
-    if hasattr(target, 'dtype'):
-        if target.dtype == 'object' or target.dtype.name == 'category':
-            return 'classification'
+    if hasattr(target, "dtype"):
+        if target.dtype == "object" or target.dtype.name == "category":
+            logger.info("Task type determined: classification")
+            return "classification"
         elif np.issubdtype(target.dtype, np.floating):
-            return 'regression'
+            logger.info("Task type determined: regression")
+            return "regression"
         elif np.issubdtype(target.dtype, np.integer):
             # For integers, check uniqueness ratio
             unique_values = len(np.unique(target))
             total_values = len(target)
-            
+            logger.debug(f"Unique/total values ratio: {unique_values}/{total_values}")
             if unique_values / total_values < 0.1:
-                return 'classification'
+                logger.info("Task type determined: classification (integer)")
+                return "classification"
             else:
-                return 'regression'
-    
-    return 'unknown'
+                logger.info("Task type determined: regression (integer)")
+                return "regression"
+    logger.warning("Task type could not be determined, returning 'unknown'.")
+    return "unknown"
 
-def fetch_single_dataset_openml(name: str, version: int = 1, cache: bool = False, cache_dir: str = None) -> dict:
+
+def fetch_single_dataset_openml(
+    name: str, version: int = 1, cache: bool = False, cache_dir: str = None
+) -> dict:
+    logger = logging.getLogger(__name__)
     """
     Fetch a dataset from OpenML by name and version.
 
@@ -109,12 +122,19 @@ def fetch_single_dataset_openml(name: str, version: int = 1, cache: bool = False
     """
     if cache and cache_dir is None:
         cache_dir = "./openml_cache"
-    
-    dataset = fetch_openml(name=name, version=version, as_frame=True, cache=cache, data_home=cache_dir)
+
+    logger.info(f"Fetching OpenML dataset: {name}, version: {version}, cache: {cache}")
+    dataset = fetch_openml(
+        name=name, version=version, as_frame=True, cache=cache, data_home=cache_dir
+    )
+    logger.debug(f"Fetched dataset: {name}")
     return dataset
 
 
-def fetch_datasets_openml(dataset_ids: list, cache: bool = False, cache_dir: str = None) -> dict:
+def fetch_datasets_openml(
+    dataset_ids: list, cache: bool = False, cache_dir: str = None
+) -> dict:
+    logger = logging.getLogger(__name__)
     """
     Fetch multiple datasets from OpenML by their IDs.
 
@@ -126,15 +146,23 @@ def fetch_datasets_openml(dataset_ids: list, cache: bool = False, cache_dir: str
     Returns:
         dict: A dictionary with dataset names as keys and DataFrames as values.
     """
+    logger.info(f"Fetching multiple OpenML datasets: {dataset_ids}")
     datasets = {}
     for dataset_id in dataset_ids:
-        dataset = fetch_openml(data_id=dataset_id, as_frame=True, cache=cache, data_home=cache_dir)
+        logger.debug(f"Fetching dataset id: {dataset_id}")
+        dataset = fetch_openml(
+            data_id=dataset_id, as_frame=True, cache=cache, data_home=cache_dir
+        )
         datasets[dataset_id] = dataset
-    
-    
+        logger.debug(f"Fetched dataset id: {dataset_id}")
+    logger.info(f"Fetched {len(datasets)} datasets.")
     return datasets
 
 
 if __name__ == "__main__":
-    reg_datasets = fetch_datasets_openml(list(DATASETS_REG.values()), cache=True, cache_dir="./openml_cache")
-    cls_datasets = fetch_datasets_openml(list(DATASETS_CLS.values()), cache=True, cache_dir="./openml_cache")
+    reg_datasets = fetch_datasets_openml(
+        list(DATASETS_REG.values()), cache=True, cache_dir="./openml_cache"
+    )
+    cls_datasets = fetch_datasets_openml(
+        list(DATASETS_CLS.values()), cache=True, cache_dir="./openml_cache"
+    )

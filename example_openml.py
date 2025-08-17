@@ -2,6 +2,7 @@
 Run a small OpenML benchmark for the custom MissingEstimator.
 """
 
+import logging
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
@@ -17,26 +18,66 @@ from missing_vals.openml import (
 from missing_vals.utils import augment_with_missing_values
 from missing_vals.model import MissingEstimator
 
+# --------------------------------------------------------------------------- #
+# Logging setup
+# --------------------------------------------------------------------------- #
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+def _sin(x, period):
+    return np.sin(2 * np.pi * x / period)
+
+
+def _cos(x, period):
+    return np.cos(2 * np.pi * x / period)
+
+
 def _encode_date_column(col: str, df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert a date column to a numerical representation.
+    Convert a date column to cyclical numerical features (sine/cosine).
+    Adds:
+      {col}_month_{sin,cos}, {col}_dow_{sin,cos}, {col}_hour_{sin,cos},
+      {col}_minute_{sin,cos}, {col}_doy_{sin,cos}, {col}_is_weekend
+    Drops the original date column.
     """
-    # First convert to datetime
-    df[col] = pd.to_datetime(df[col], errors="coerce")
+    df = df.copy()
+    s = pd.to_datetime(df[col], errors="coerce")
 
-    df[f"{col}_year"] = df[col].dt.year
-    df[f"{col}_month"] = df[col].dt.month
-    df[f"{col}_day"] = df[col].dt.day
-    df[f"{col}_dayofweek"] = df[col].dt.dayofweek  # 0=Monday
-    df[f"{col}_hour"] = df[col].dt.hour
-    df[f"{col}_minute"] = df[col].dt.minute
-    df[f"{col}_second"] = df[col].dt.second
-    df[f"{col}_is_weekend"] = df[col].dt.dayofweek.isin([5, 6]).astype(int)
-    return df.drop(columns=[col])  # remove original date column
+    # Components (as floats to allow NaN)
+    month = s.dt.month.astype("float")  # 1..12
+    dow = s.dt.dayofweek.astype("float")  # 0..6 (Mon=0)
+    hour = s.dt.hour.astype("float")  # 0..23
+    minute = s.dt.minute.astype("float")  # 0..59
+    doy = s.dt.dayofyear.astype("float")  # 1..365/366
+
+    # Cyclical encodings
+    df[f"{col}_month_sin"] = _sin(month - 1, 12)  # shift to 0..11
+    df[f"{col}_month_cos"] = _cos(month - 1, 12)
+
+    df[f"{col}_dow_sin"] = _sin(dow, 7)
+    df[f"{col}_dow_cos"] = _cos(dow, 7)
+
+    df[f"{col}_hour_sin"] = _sin(hour, 24)
+    df[f"{col}_hour_cos"] = _cos(hour, 24)
+
+    df[f"{col}_minute_sin"] = _sin(minute, 60)
+    df[f"{col}_minute_cos"] = _cos(minute, 60)
+
+    # Use 365.25 to smooth across leap years (doy is 1..366)
+    df[f"{col}_doy_sin"] = _sin(doy - 1, 365.25)
+    df[f"{col}_doy_cos"] = _cos(doy - 1, 365.25)
+
+    # Useful binary feature
+    df[f"{col}_is_weekend"] = s.dt.dayofweek.isin([5, 6]).astype("Int8")
+
+    return df.drop(columns=[col])
 
 
 def transform_data(
@@ -50,10 +91,8 @@ def transform_data(
         c for c in train_X.columns if isinstance(train_X[c].dtype, pd.CategoricalDtype)
     ]
     numeric_cols = [c for c in train_X.columns if c not in categorical_cols]
-    print(
-        f"  ── Categorical columns: {categorical_cols}"
-        f"\n  ── Numeric columns: {numeric_cols}"
-    )
+    logger.debug(f"Categorical columns: {categorical_cols}")
+    logger.debug(f"Numeric columns: {numeric_cols}")
 
     # Detect categorical columns that are actually dates
     date_categorical_cols = []
@@ -68,18 +107,21 @@ def transform_data(
             continue
 
     if date_categorical_cols:
-        print(f"  ── Categorical columns detected as dates: {date_categorical_cols}")
+        logger.info(f"Categorical columns detected as dates: {date_categorical_cols}")
         # Remove from categorical_cols and handle separately
         categorical_cols = [
             c for c in categorical_cols if c not in date_categorical_cols
         ]
         # Process each date column
         for col in date_categorical_cols:
-            train_X = _encode_date_column(col, train_X)
-            test_X = _encode_date_column(col, test_X)
+            # Optionally encode date columns here
+            logger.debug(f"Dropping date column: {col}")
+            train_X = train_X.drop(columns=col)
+            test_X = test_X.drop(columns=col)
 
     # one-hot (dense so we can wrap in a DataFrame)
     if categorical_cols:
+        logger.debug(f"One-hot encoding columns: {categorical_cols}")
         ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
         train_cat = ohe.fit_transform(train_X[categorical_cols])
         test_cat = ohe.transform(test_X[categorical_cols])
@@ -102,6 +144,7 @@ def transform_data(
 
     # z-score
     if numeric_cols:
+        logger.debug(f"Standardizing numeric columns: {numeric_cols}")
         scaler = StandardScaler()
         train_X[numeric_cols] = scaler.fit_transform(train_X[numeric_cols])
         test_X[numeric_cols] = scaler.transform(test_X[numeric_cols])
@@ -126,37 +169,44 @@ def pretty_stats(values: list[float]) -> str:
 # main
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
-    all_datasets = {**DATASETS_REG, **DATASETS_CLS}
+    all_datasets = {**DATASETS_CLS, **DATASETS_REG}
 
-    print("▼ Downloading OpenML datasets (this is cached on first run)…")
+    logger.info("▼ Downloading OpenML datasets (this is cached on first run)…")
     datasets = fetch_datasets_openml(
         list(all_datasets.values()), cache=True, cache_dir=Path("./openml_cache")
     )
 
     for ds_name, ds_id in all_datasets.items():
-        print(f"════════ Dataset: {ds_name}  (id={ds_id})")
+        logger.info(f"════════ Dataset: {ds_name}  (id={ds_id})")
         ds = datasets[ds_id]
         # Save the combined dataset as a CSV for debugging
         combined_df = pd.concat([ds.frame, ds.target.rename("target")], axis=1)
         combined_df.to_csv("debug.csv", index=False)
-        print("✓ Datasets ready\n")
+        logger.debug("Saved combined dataset to debug.csv")
+        logger.info("✓ Datasets ready")
         task = determine_task_type(ds)  # 'classification' / 'regression'
         y = ds.target.copy(deep=True)
         X = ds.frame.drop(columns=y.name)
 
         if task == "classification" and not pd.api.types.is_numeric_dtype(y):
+            logger.debug(
+                "Converting target to categorical codes for classification task."
+            )
             y = y.astype("category").cat.codes  # make labels integer
 
         for imp in ["zero", "mean", "knn", "iterative", "promissing", "mpromissing"]:
-            print(f"  ─ imputer = {imp}")
+            logger.info(f"Imputer: {imp}")
 
             stats = {"acc": [], "auc": [], "r2": []}
 
             for split_seed in tqdm(range(5), leave=False):
+                logger.debug(f"Split seed: {split_seed}")
                 # 50 % hold-out split
                 train_idx = X.sample(frac=0.5, random_state=split_seed).index
                 X_train, y_train = X.loc[train_idx], y.loc[train_idx]
                 X_test, y_test = X.drop(train_idx), y.drop(train_idx)
+
+                logger.debug(f"Train size: {len(train_idx)}, Test size: {len(X_test)}")
 
                 # optional artificial missingness
                 X_train_aug = augment_with_missing_values(
@@ -183,7 +233,7 @@ if __name__ == "__main__":
 
             # ────────────────── summary for this imputer ──────────────────
             if task == "classification":
-                print(f"      accuracy : {pretty_stats(stats['acc'])}")
-                print(f"      ROC-AUC  : {pretty_stats(stats['auc'])}\n")
+                logger.info(f"      accuracy : {pretty_stats(stats['acc'])}")
+                logger.info(f"      ROC-AUC  : {pretty_stats(stats['auc'])}")
             else:
-                print(f"      R² score : {pretty_stats(stats['r2'])}\n")
+                logger.info(f"      R² score : {pretty_stats(stats['r2'])}")
