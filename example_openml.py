@@ -17,10 +17,29 @@ from missing_vals.openml import (
 from missing_vals.utils import augment_with_missing_values
 from missing_vals.model import MissingEstimator
 
-
+# --------------------------------------------------------------------------- #
+# TODO: El problem esta en el transform_data, que no maneja bien los dias 
+# y mete muchos ceros
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+def _encode_date_column(col: str, df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert a date column to a numerical representation.
+    """
+    # First convert to datetime
+    df[col] = pd.to_datetime(df[col], errors="coerce")
+    
+    df[f"{col}_year"] = df[col].dt.year
+    df[f"{col}_month"] = df[col].dt.month
+    df[f"{col}_day"] = df[col].dt.day
+    df[f"{col}_dayofweek"] = df[col].dt.dayofweek  # 0=Monday
+    df[f"{col}_hour"] = df[col].dt.hour
+    df[f"{col}_minute"] = df[col].dt.minute
+    df[f"{col}_second"] = df[col].dt.second
+    df[f"{col}_is_weekend"] = df[col].dt.dayofweek.isin([5,6]).astype(int)
+    return df.drop(columns=[col])  # remove original date column
+
 def transform_data(
     train_X: pd.DataFrame, test_X: pd.DataFrame
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -32,7 +51,30 @@ def transform_data(
         c for c in train_X.columns if isinstance(train_X[c].dtype, pd.CategoricalDtype)
     ]
     numeric_cols = [c for c in train_X.columns if c not in categorical_cols]
+    print(f"  ── Categorical columns: {categorical_cols}"
+          f"\n  ── Numeric columns: {numeric_cols}")
+    
+    # Detect categorical columns that are actually dates
+    date_categorical_cols = []
+    for col in categorical_cols:
+        # Try converting to datetime; if many values succeed, treat as date
+        try:
+            parsed = pd.to_datetime(train_X[col], errors="coerce")
+            # If more than half the values are parsed as dates, consider it a date column
+            if parsed.notna().mean() > 0.5:
+                date_categorical_cols.append(col)
+        except Exception:
+            continue
 
+    if date_categorical_cols:
+        print(f"  ── Categorical columns detected as dates: {date_categorical_cols}")
+        # Remove from categorical_cols and handle separately
+        categorical_cols = [c for c in categorical_cols if c not in date_categorical_cols]
+        # Process each date column
+        for col in date_categorical_cols:
+            train_X = _encode_date_column(col, train_X)
+            test_X = _encode_date_column(col, test_X)
+    
     # one-hot (dense so we can wrap in a DataFrame)
     if categorical_cols:
         ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
@@ -87,11 +129,15 @@ if __name__ == "__main__":
     datasets = fetch_datasets_openml(
         list(all_datasets.values()), cache=True, cache_dir=Path("./openml_cache")
     )
-    print("✓ Datasets ready\n")
+    
 
     for ds_name, ds_id in all_datasets.items():
         print(f"════════ Dataset: {ds_name}  (id={ds_id})")
         ds = datasets[ds_id]
+        # Save the combined dataset as a CSV for debugging
+        combined_df = pd.concat([ds.frame, ds.target.rename("target")], axis=1)
+        combined_df.to_csv("debug.csv", index=False)
+        print("✓ Datasets ready\n")
         task = determine_task_type(ds)  # 'classification' / 'regression'
         y = ds.target.copy(deep=True)
         X = ds.frame.drop(columns=y.name)
@@ -123,7 +169,7 @@ if __name__ == "__main__":
                 # model
                 est = MissingEstimator(
                     imputer_name=imp,
-                    epochs=1000,
+                    epochs=10,
                     early_stopping=0.1,
                     patience=20,
                     random_state=split_seed,

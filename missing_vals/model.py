@@ -33,6 +33,7 @@ from sklearn.metrics import (
 from .utils import set_seed, augment_with_missing_values
 from .promissing import PromissingLinear, mPromissingLinear
 from .compass_net import COMPASSNet
+import json
 
 
 def _get_activation(name: str) -> nn.Module:
@@ -47,7 +48,7 @@ def _get_activation(name: str) -> nn.Module:
         "softmax": nn.Softmax(dim=-1),
     }
     if name == "linear":
-        return nn.Identity()
+        return None
     if name not in activations:
         raise ValueError(f"Unknown activation function: {name}")
     return activations[name.strip().lower()]
@@ -65,15 +66,35 @@ class _Net(nn.Module):
         output_activation: str = "sigmoid",
     ) -> None:
         super().__init__()
-        self.hidden = nn.Linear(input_dim, hidden_dims[0], bias=True)
+        self.hidden = nn.Linear(input_dim, hidden_dims[0])
+        print(f"Input dimension: {input_dim}, Hidden dimensions: {hidden_dims}")
         self.act = _get_activation(activation)
-        self.out = nn.Linear(hidden_dims[0], output_dim, bias=True)
+        
+        self.out = nn.Linear(hidden_dims[0], output_dim)
         self.out_act = _get_activation(output_activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.act(self.hidden(x))
-        x = self.out_act(self.out(x))
-        return x
+        print(f"Input tensor shape: {x.shape}")
+        print(f"Activation function: {self.act}")
+        # Check for NaNs or infinite values in the input tensor
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            raise ValueError("Input tensor contains NaNs or infinite values, which may cause the hidden layer to return NaNs")
+        with open("input_tensor.json", "w") as f:
+            json.dump(x.cpu().numpy().tolist(), f)
+        x = self.hidden(x)
+        assert not torch.isnan(x).any(), "Hidden layer output contains NaNs"
+        if self.act is not None:
+            x = self.act(x)
+        print(f"After activation, tensor shape: {x.shape}")
+        assert not torch.isnan(x).any(), "Activation output contains NaNs"
+        assert not torch.isnan(x).any(), "Hidden layer output contains NaNs"
+        out = self.out(x)
+        assert not torch.isnan(out).any(), "Output tensor contains NaNs"
+        if self.out_act is None:
+            return out
+        out = self.out_act(out)
+        assert not torch.isnan(out).any(), "Output tensor contains NaNs after activation"
+        return out
 
 
 class _PromissingNet(nn.Module):
@@ -538,10 +559,13 @@ class MissingEstimator(BaseEstimator):
         check_is_fitted(self)
         device = self._get_device()
         X = np.asarray(X, dtype=np.float32)
+
         if self.imputer is not None:
             X = self.imputer.transform(X)
+
         self._model_.eval()
         preds = self._model_(torch.tensor(X, dtype=torch.float32).to(device))
+
         return preds.cpu().numpy().flatten()
 
     def _predict_multi_class(self, X: np.ndarray) -> np.ndarray:
@@ -621,7 +645,7 @@ class MissingEstimator(BaseEstimator):
             # Get predictions and probabilities
             y_pred = self.predict(X)
             y_proba = self.predict_proba(X)[:, 1]  # Probability of positive class
-
+    
             scores = {
                 "accuracy": accuracy_score(y, y_pred),
                 "precision": precision_score(
@@ -653,7 +677,7 @@ class MissingEstimator(BaseEstimator):
 
         else:  # regression
             y_pred = self.predict(X)
-
+            print(y_pred)
             scores = {
                 "r2": r2_score(y, y_pred),
                 "mse": mean_squared_error(y, y_pred),
