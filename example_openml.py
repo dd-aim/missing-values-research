@@ -170,7 +170,7 @@ def run_openml_experiment(
     # Model/training defaults (per spec)
     EPOCHS = 100
     BATCH_SIZE = 10
-    LR = 0.1
+    LR = 0.01
     ACTIVATION = "relu"
     EARLY_STOPPING = 0.1
     PATIENCE = 50
