@@ -4,6 +4,8 @@ from sklearn.datasets import fetch_openml
 from tqdm import tqdm
 import logging
 
+logger = logging.getLogger(__name__)
+
 DATASETS_CLS = {
     "space-ga": 737,
     "pollen": 871,
@@ -85,14 +87,18 @@ def determine_task_type(dataset) -> str:
         return "unknown"
 
     s = pd.Series(target).dropna()
-    logger.debug(f"Determining task type for target with dtype: {getattr(s, 'dtype', None)}")
+    logger.debug(
+        f"Determining task type for target with dtype: {getattr(s, 'dtype', None)}"
+    )
 
     if s.empty:
         logger.warning("Target is empty after dropping NaNs; returning 'unknown'.")
         return "unknown"
 
     # 1) Categorical or object → classification
-    if pd.api.types.is_categorical_dtype(s.dtype) or pd.api.types.is_object_dtype(s.dtype):
+    if pd.api.types.is_categorical_dtype(s.dtype) or pd.api.types.is_object_dtype(
+        s.dtype
+    ):
         logger.info("Task type determined: classification (categorical/object)")
         return "classification"
 
@@ -101,7 +107,9 @@ def determine_task_type(dataset) -> str:
         arr = s.to_numpy()
         arr = arr[np.isfinite(arr)]
         if arr.size == 0:
-            logger.info("Task type determined: regression (numeric but no finite values)")
+            logger.info(
+                "Task type determined: regression (numeric but no finite values)"
+            )
             return "regression"
 
         # Integer-like check (allow float storage of ints)
@@ -113,7 +121,7 @@ def determine_task_type(dataset) -> str:
 
             consecutive = np.array_equal(vals, np.arange(vmin, vmax + 1))
             starts_ok = vmin in (0, 1)
-            dense_0_to_20 = (vmin == 0 and vmax == 20 and consecutive)  # special-case
+            dense_0_to_20 = vmin == 0 and vmax == 20 and consecutive  # special-case
 
             logger.debug(
                 f"integer_like={integer_like}, k={k}, vmin={vmin}, vmax={vmax}, "
@@ -121,7 +129,9 @@ def determine_task_type(dataset) -> str:
             )
 
             if consecutive and starts_ok and ((2 <= k <= 20) or dense_0_to_20):
-                logger.info("Task type determined: classification (integer, consecutive, start 0/1)")
+                logger.info(
+                    "Task type determined: classification (integer, consecutive, start 0/1)"
+                )
                 return "classification"
 
         # Anything else numeric → regression
@@ -131,7 +141,6 @@ def determine_task_type(dataset) -> str:
     # 3) Fallback
     logger.warning("Task type could not be determined, returning 'unknown'.")
     return "unknown"
-
 
 
 def fetch_single_dataset_openml(

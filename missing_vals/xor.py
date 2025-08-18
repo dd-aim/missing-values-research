@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from jenga.corruptions.generic import MissingValues
+import logging
 
 import torch
 import torch.nn as nn
@@ -22,6 +23,9 @@ from .utils import set_seed, augment_with_missing_values
 from .promissing import PromissingLinear, mPromissingLinear
 from .compass_net import COMPASSNet
 
+logger = logging.getLogger(__name__)
+
+
 def generate_xor(n_samples=1_000, noise_var=0.25, random_state=42):
     """
     Reproduces the dataset in Sec. 3.1 of the PROMISSING paper.
@@ -34,6 +38,12 @@ def generate_xor(n_samples=1_000, noise_var=0.25, random_state=42):
     y = ((X[:, 0] > 0) ^ (X[:, 1] > 0)).astype(int)  # Bayes-optimal rule
     df = pd.DataFrame(X, columns=["x1", "x2"])
     df["target"] = y
+    logger.info(
+        "Generated XOR dataset: n=%d, noise_var=%.3f, seed=%s",
+        n_samples,
+        noise_var,
+        str(random_state),
+    )
     return df
 
 
@@ -64,6 +74,10 @@ def create_benchmark_datasets(
         xor_df.to_parquet(
             os.path.join(output_dir, "xor_datasets", "xor_clean.parquet"), index=False
         )
+        logger.info(
+            "Saved clean XOR dataset to %s",
+            os.path.join(output_dir, "xor_datasets", "xor_clean.parquet"),
+        )
     if not low_memory:
         datasets_with_holes = dict()
 
@@ -76,6 +90,12 @@ def create_benchmark_datasets(
     for mech in missingness_types:
         for frac in missing_fractions:
             impacted_col = random.choice(["x1", "x2"])  # Choose between "x1" and "x2"
+            logger.debug(
+                "Applying missingness: mech=%s, frac=%.2f, column=%s",
+                mech,
+                frac,
+                impacted_col,
+            )
             corruption = MissingValues(
                 column=impacted_col,
                 fraction=frac,
@@ -85,16 +105,18 @@ def create_benchmark_datasets(
             df_corrupted = corruption.transform(xor_df.copy(deep=True))
             key = f"{mech}_{int(frac*100)}"
             if save_to_disk:
-                df_corrupted.to_parquet(
-                    os.path.join(output_dir, "xor_datasets", f"xor_{key}.parquet"),
-                    index=False,
-                )
+                path = os.path.join(output_dir, "xor_datasets", f"xor_{key}.parquet")
+                df_corrupted.to_parquet(path, index=False)
+                logger.info("Saved corrupted XOR dataset to %s", path)
             if not low_memory:
                 datasets_with_holes[key] = df_corrupted
 
             progress_bar.update(1)
 
     if not low_memory:
+        logger.info(
+            "Created %d corrupted XOR datasets in-memory", len(datasets_with_holes)
+        )
         return datasets_with_holes
 
 
@@ -148,7 +170,6 @@ def create_benchmark_datasets(
 #         x = self.act(self.hidden(x))
 #         x = self.sigm(self.out(x))
 #         return x
-
 
 
 # class XOREstimator(BaseEstimator, ClassifierMixin):
@@ -232,7 +253,7 @@ def create_benchmark_datasets(
 
 #         y = y.astype(np.float32).reshape(-1, 1)
 #         return X, y
-    
+
 #     # --------------------------------------------------------------------- #
 #     # Scikit-learn API
 #     # --------------------------------------------------------------------- #
@@ -256,10 +277,10 @@ def create_benchmark_datasets(
 #                 self._model_ = _mPromissingXORNet().to(device)
 #             else:
 #                 self._model_ = _XORNet().to(device)
-        
+
 #         criterion = nn.BCELoss()
 #         optimiser = optim.SGD(self._model_.parameters(), lr=self.lr)
-        
+
 #         # Decide whether to split validation
 #         if self.early_stopping and 0.0 < self.early_stopping < 1.0:
 #             # Shuffle X and y together
@@ -283,12 +304,12 @@ def create_benchmark_datasets(
 #             X_train = self.imputer.transform(X_train)
 #             if has_val:
 #                 X_val = self.imputer.transform(X_val)
-        
+
 #         # Check and convert input data
 #         X_train, y_train = self._check_X_y(X_train, y_train)
 #         if has_val:
 #             X_val, y_val = self._check_X_y(X_val, y_val)
-        
+
 #         # Build data loaders
 #         train_ds = torch.utils.data.TensorDataset(
 #             torch.tensor(X_train, dtype=torch.float32),

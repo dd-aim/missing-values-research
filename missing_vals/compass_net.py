@@ -6,19 +6,119 @@ COMPASS-Net (COMbinatorial PAttern Sub-modelS Network)
 - Variable-depth sub-models: hidden_dims=(...) builds stacked hidden layers
 - max_missing controls the largest missing-feature mask handled at inference
 """
+# TODO: Given an input [A,B,C,D] and a batch [[A1,B1,C1,D1], [A2,B2,NaN,D2], [NaN,B3,C3,D3], [A4,B4,C4,NaN3], [A5,B5,C5,D5]]
+# The model must train all possible sub-models for missing patterns:
+# - [A,B,C,D] -> full model + all missing patterns models
+# - [A2,B2,NaN,D2] -> all missing patterns models that they not include C
+# - [NaN,B3,C3,D3] -> all missing patterns models that they not include A
+# - [A4,B4,NaN,D4] -> all missing patterns models that they not include C
+# - [A5,B5,C5,D5] -> full model + all missing patterns models
 
 from __future__ import annotations
 
 import itertools
 from typing import Dict, Iterable, Tuple, Type, Sequence, Optional
+import logging
+from itertools import combinations
+
+import numpy as np
+import pandas as pd
 
 import torch
 import torch.nn as nn
+
+# Module logger
+logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------------- #
+# Data Preprocessing for Compass training
+# ----------------------------------------------------------------------------- #
+def augment_with_missing_values(
+    data: pd.DataFrame,
+    missing_cols: list = [1, 2],
+) -> pd.DataFrame:
+    """
+    Augment a DataFrame by introducing missing values with different patterns.
+
+    Args:
+        data (pd.DataFrame): The input DataFrame.
+        augmentation_fraction (float): Fraction of rows to augment with missing values.
+        exclude_columns (list): Columns to exclude from augmentation.
+        random_state (int): Seed for reproducibility.
+        missing_cols (list): List specifying number of columns to make missing simultaneously:
+            - 1: Single column missing (one column at a time)
+            - 2: Every combination of 2 columns missing
+            - 3: Every combination of 3 columns missing
+            - etc.
+
+    Returns:
+        pd.DataFrame: Augmented DataFrame with missing values following specified patterns.
+    """
+    if exclude_columns is None:
+        exclude_columns = []
+    elif isinstance(exclude_columns, str):
+        exclude_columns = [exclude_columns]
+    elif not isinstance(exclude_columns, list):
+        raise TypeError("exclude_columns must be a list or a string")
+
+    if data.empty:
+        logger.error("Input DataFrame is empty")
+        raise ValueError("Input DataFrame is empty")
+
+    # Get eligible columns for augmentation
+    eligible_columns = [col for col in data.columns if col not in exclude_columns]
+
+    if not eligible_columns:
+        logger.error("No eligible columns found for augmentation.")
+        raise ValueError("No eligible columns found for augmentation.")
+    
+    augmented_samples = []
+    
+    for missing_idx, num_missing in enumerate(missing_cols):
+        if num_missing == 1:
+            for i, column in enumerate(eligible_columns):
+                mask = data[column].notna()
+                aug_sample = data[mask].copy()
+                aug_sample[column] = np.nan
+                other_cols = [col for col in eligible_columns if col != column]
+                if other_cols:
+                    aug_sample = aug_sample.dropna(subset=other_cols)
+                if not aug_sample.empty:
+                    logger.debug(
+                        f"Augmented sample for column {column}, rows: {len(aug_sample)}"
+                    )
+                    augmented_samples.append(aug_sample)
+        elif num_missing >= 2 and num_missing < len(eligible_columns):
+            column_combinations = list(combinations(eligible_columns, num_missing))
+            for combo_idx, missing_column_combo in enumerate(column_combinations):
+                mask = data[list(missing_column_combo)].notna().all(axis=1)
+                aug_sample = data[mask].copy()
+                for col in missing_column_combo:
+                    aug_sample[col] = np.nan
+                other_cols = [
+                    col for col in eligible_columns if col not in missing_column_combo
+                ]
+                if other_cols:
+                    aug_sample = aug_sample.dropna(subset=other_cols)
+                if not aug_sample.empty:
+                    logger.debug(
+                        f"Augmented sample for columns {missing_column_combo}, rows: {len(aug_sample)}"
+                    )
+                    augmented_samples.append(aug_sample)
+    if augmented_samples:
+        logger.info(f"Created {len(augmented_samples)} augmented samples.")
+        result = pd.concat([data] + augmented_samples, axis=0, ignore_index=True)
+        return result.reset_index(drop=True)
+    else:
+        logger.warning("No augmented samples created. Returning original data.")
+        return data
 
 
 # ----------------------------------------------------------------------------- #
 # Utilities
 # ----------------------------------------------------------------------------- #
+
 
 def _resolve_activation(task: str, output_activation: str | None) -> Optional[str]:
     """Resolve a concrete output activation from (task, output_activation).
@@ -43,6 +143,7 @@ def _resolve_activation(task: str, output_activation: str | None) -> Optional[st
 # ----------------------------------------------------------------------------- #
 # Sub-network
 # ----------------------------------------------------------------------------- #
+
 
 class _CompassSubNet(nn.Module):
     """MLP with variable depth and task-aware head.
@@ -107,6 +208,7 @@ class _CompassSubNet(nn.Module):
 # Router mixin
 # ----------------------------------------------------------------------------- #
 
+
 class _RouterMixin:
     """Routing logic shared by all COMPASS variants."""
 
@@ -136,6 +238,11 @@ class _RouterMixin:
                     n_classes=n_classes,
                     output_activation=output_activation,
                 )
+        logger.debug(
+            "Built %d subnets for patterns up to size %s",
+            len(patterns),
+            max(pattern_sizes) if pattern_sizes else 0,
+        )
         # store as string keys for ModuleDict
         return nn.ModuleDict({str(k): v for k, v in patterns.items()})  # type: ignore
 
@@ -156,12 +263,19 @@ class _RouterMixin:
 
         # Extract observed features
         observed_x = x[:, observed_mask]
+        logger.debug(
+            "Routing batch of size %d with pattern %s to subnet having in_dim=%d",
+            x.shape[0],
+            pattern_key,
+            observed_x.shape[1],
+        )
         return subnet, observed_x
 
 
 # ----------------------------------------------------------------------------- #
 # Public model
 # ----------------------------------------------------------------------------- #
+
 
 class COMPASSNet(nn.Module, _RouterMixin):
     """COMPASS-Net with variable-depth subnets and task-aware heads.
@@ -199,7 +313,17 @@ class COMPASSNet(nn.Module, _RouterMixin):
         self.task = task
         self.n_classes = int(n_classes)
         self.output_activation = output_activation
-        self.max_missing = int(max_missing)
+        # Clamp max_missing to avoid building an all-missing subnet (sub_in_dim == 0)
+        requested_max_missing = int(max_missing)
+        max_allowed = max(0, self.in_features - 1)
+        if requested_max_missing > max_allowed:
+            logger.info(
+                "Clamping max_missing from %d to %d (in_features=%d) to avoid all-missing subnet",
+                requested_max_missing,
+                max_allowed,
+                self.in_features,
+            )
+        self.max_missing = min(requested_max_missing, max_allowed)
 
         self._subnets = self._build_subnets(
             in_features=self.in_features,
@@ -212,7 +336,11 @@ class COMPASSNet(nn.Module, _RouterMixin):
         )
 
         # Determine output dimension for allocating batch outputs
-        if (task or "binary").lower() in ("multiclass", "classification", "cls_multiclass"):
+        if (task or "binary").lower() in (
+            "multiclass",
+            "classification",
+            "cls_multiclass",
+        ):
             self._out_dim = int(n_classes)
         else:
             self._out_dim = 1
@@ -249,6 +377,9 @@ class COMPASSNet(nn.Module, _RouterMixin):
             )
             for pattern in unique_patterns
         }
+        logger.debug(
+            "Forward pass: batch=%d, unique_patterns=%s", batch_size, unique_patterns
+        )
 
         # Initialize output tensor
         outputs = torch.zeros((batch_size, self._out_dim), device=device)
