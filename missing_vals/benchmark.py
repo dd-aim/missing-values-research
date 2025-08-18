@@ -116,21 +116,21 @@ def run_missing_benchmark(
     baseline_rows: List[dict] = []
     metric_cols: Optional[List[str]] = None
 
-    for run in range(int(n_runs)):
-        base_seed = int(random_state) + run
-        logger.debug("Baseline run %d with base_seed=%d", run, base_seed)
+    logger.info("Computing dataset-level baseline for imputers: %s", list(imputers))
+    with tqdm(range(int(n_runs)), desc="Benchmarking base model", unit="run") as base_pbar:
+        for run in base_pbar:
+            base_seed = int(random_state) + run
+            logger.debug("Baseline run %d with base_seed=%d", run, base_seed)
 
-        for imp in imputers:
-            logger.info("Baseline: training imputer='%s' on run=%d", imp, run)
             est = MissingEstimator(
-                **{**dict(imputer_name=imp, random_state=base_seed), **estimator_kwargs}
+                **{**dict(imputer_name="zero", random_state=base_seed), **estimator_kwargs}
             )
             try:
                 est.fit(X_train, y_train)
                 base_scores = est.score(X_test, y_test)
                 row = dict(
                     run=run,
-                    imputer=imp,
+                    imputer="BASELINE",
                     mechanism="BASELINE",
                     fraction=0.0,
                     **{f"metric_{k}": v for k, v in base_scores.items()},
@@ -152,13 +152,13 @@ def run_missing_benchmark(
                 baseline_rows.append(
                     dict(
                         run=run,
-                        imputer=imp,
+                        imputer="BASELINE",
                         mechanism="ERROR",
                         fraction=np.nan,
                         metric_error=str(e),
                     )
                 )
-
+    
     baseline_df = pd.DataFrame(baseline_rows)
     if baseline_df.empty or (metric_cols is None):
         logger.warning(
