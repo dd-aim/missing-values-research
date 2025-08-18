@@ -1,83 +1,114 @@
+# compass_net.py
 """
-COMPASS-Net (COMbinatorial PAttern Sub-modelS Network) python implementation
+COMPASS-Net (COMbinatorial PAttern Sub-modelS Network)
 
-Problem addressed:
-    Robust inference in fully-connected, feed-forward neural networks (FC-FF NNs) when 1 or 2 input features are missing at test time, without resorting to imputation.
-Key idea:
-    Train a separate sub-network for every missing-feature pattern of size 1 or 2, then at inference time route each sample to the sub-network that matches its mask of missing features.
-Number of sub-networks:
-    For an input dimension n:
-        • 1-feature-missing patterns: n
-        • 2-features-missing patterns: C(n, 2) = n(n – 1)/2
-      Total = n + n(n – 1)/2 = n(n + 1)/2 sub-models.
-      (Extension to larger masks is possible.)
-Architecture of each sub-network:
-    • Hidden layers: identical depth, width, activations, and initial hyper-parameters as the original “full” model.
-    • Input layer: width = n – k, where k ∈ {1, 2}.
-    • Output layer: unchanged.
-Training data per sub-network:
-    Use the same full training set, but delete the corresponding feature(s) in every row so that the network sees a consistent mask during training. No synthetic imputation is performed.
-Training procedure:
-    1. Start from the architecture/hyper-parameters of a well-performing baseline FC-FF NN.
-    2. For each mask pattern:
-        a. Delete the masked feature column(s) from every row.
-        b. Re-initialize and train the model end-to-end (optimizer, epochs, loss, etc. unchanged from the baseline).
-    3. Optionally train the baseline “no-features-missing” model alongside the masked sub-networks.
-On-chip deployment:
-    All sub-networks are stored simultaneously on the target inference chip; the hardware automatically selects and runs the correct sub-network once it sees which feature(s) are absent in an input vector.
-Inference workflow:
-    1. Detect which features (if any) are missing in the incoming sample.
-    2. Remove those feature slots.
-    3. Dispatch the reduced vector to the sub-network whose mask matches.
-Evaluation protocol:
-    • Create perturbed copies of the hold-out / validation set by randomly dropping 1 feature in X % of rows and 2 features in Y % of rows (e.g. X = 3 %, Y = 1 %).
-    • For each row, run the appropriate sub-network.
-    • Report pattern-wise and overall accuracy; sweep several (X, Y) pairs for robustness.
-Scalability / extensions:
-    • If domain knowledge or deployment data indicate >2 missing features are likely, extend the ensemble to larger mask sizes (combinatorial growth is the only constraint).
-    • Can incorporate model-compression or parameter-sharing techniques to stay within chip memory if n is large.
+- Task-aware head: supports binary, multiclass, and regression
+- Variable-depth sub-models: hidden_dims=(...) builds stacked hidden layers
+- max_missing controls the largest missing-feature mask handled at inference
 """
 
 from __future__ import annotations
 
 import itertools
-from typing import Dict, Iterable, Tuple, Type
+from typing import Dict, Iterable, Tuple, Type, Sequence, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-# -----------------------------------------------------------------------------
-# COMPASS building blocks ------------------------------------------------------
-# -----------------------------------------------------------------------------
 
+# ----------------------------------------------------------------------------- #
+# Utilities
+# ----------------------------------------------------------------------------- #
+
+def _resolve_activation(task: str, output_activation: str | None) -> Optional[str]:
+    """Resolve a concrete output activation from (task, output_activation).
+
+    Returns one of: 'sigmoid', 'softmax', 'linear', or None.
+    """
+    task_l = (task or "binary").lower()
+    act = (output_activation or "auto").lower()
+
+    if act == "auto":
+        if task_l in ("binary", "classification_binary", "cls_binary"):
+            return "sigmoid"
+        elif task_l in ("multiclass", "classification", "cls_multiclass"):
+            return "softmax"
+        elif task_l in ("regression", "reg"):
+            return "linear"
+        else:
+            return "linear"  # default
+    return act
+
+
+# ----------------------------------------------------------------------------- #
+# Sub-network
+# ----------------------------------------------------------------------------- #
 
 class _CompassSubNet(nn.Module):
-    """A tiny MLP: (d-in) → 4 tanh → 1 sigmoid.
+    """MLP with variable depth and task-aware head.
 
-    The *Linear* class of the first layer can be swapped for PROMISSING
-    variants by passing ``linear_cls``.
+    Hidden: as many Linear(+tanh) layers as provided in `hidden_dims`.
+    Head:
+        - regression: Linear -> (no activation) or 'linear'
+        - binary:     Linear(->1) -> Sigmoid if required
+        - multiclass: Linear(->n_classes) -> Softmax if required
     """
 
     def __init__(
         self,
         in_features: int,
+        hidden_dims: Sequence[int] = (4,),
         linear_cls: Type[nn.Linear] = nn.Linear,
-        hidden_units: int = 4,
+        task: str = "binary",
+        n_classes: int = 2,
+        output_activation: str | None = "auto",
     ) -> None:
         super().__init__()
-        self.hidden = linear_cls(in_features, hidden_units, bias=True)
-        self.act = nn.Tanh()
-        self.out = nn.Linear(hidden_units, 1, bias=True)
-        self.sigm = nn.Sigmoid()
+        # Hidden stack
+        self.hidden_layers = nn.ModuleList()
+        prev = in_features
+        for h in hidden_dims:
+            self.hidden_layers.append(linear_cls(prev, int(h), bias=True))
+            prev = int(h)
+
+        # Head
+        task_l = (task or "binary").lower()
+        if task_l in ("regression", "reg"):
+            out_dim = 1
+        elif task_l in ("binary", "classification_binary", "cls_binary"):
+            out_dim = 1
+        elif task_l in ("multiclass", "classification", "cls_multiclass"):
+            if int(n_classes) < 2:
+                raise ValueError("For multiclass, n_classes must be >= 2")
+            out_dim = int(n_classes)
+        else:
+            out_dim = 1
+
+        self.out = nn.Linear(prev, out_dim, bias=True)
+        self._final_act = _resolve_activation(task_l, output_activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore
-        x = self.act(self.hidden(x))
-        return self.sigm(self.out(x))
+        for layer in self.hidden_layers:
+            x = torch.tanh(layer(x))
+        x = self.out(x)
+        # Apply head activation if requested
+        if self._final_act == "sigmoid":
+            return torch.sigmoid(x)
+        elif self._final_act == "softmax":
+            return torch.softmax(x, dim=-1)
+        elif self._final_act in ("linear", None):
+            return x
+        else:
+            # Fallback: no activation
+            return x
 
+
+# ----------------------------------------------------------------------------- #
+# Router mixin
+# ----------------------------------------------------------------------------- #
 
 class _RouterMixin:
-    """Mixin that provides routing logic shared by all COMPASS variants."""
+    """Routing logic shared by all COMPASS variants."""
 
     def _mask_to_key(self, mask: torch.Tensor) -> Tuple[int, ...]:
         """Convert boolean mask vector to an *ordered* tuple of missing indices."""
@@ -87,35 +118,31 @@ class _RouterMixin:
         self,
         in_features: int,
         linear_cls: Type[nn.Linear],
+        hidden_dims: Sequence[int],
+        task: str,
+        n_classes: int,
+        output_activation: str | None,
         pattern_sizes: Iterable[int] = (0, 1, 2),
-    ) -> Dict[Tuple[int, ...], _CompassSubNet]:
+    ) -> nn.ModuleDict:
         patterns: Dict[Tuple[int, ...], _CompassSubNet] = {}
         for k in pattern_sizes:
             for comb in itertools.combinations(range(in_features), k):
                 sub_in_dim = in_features - k
                 patterns[comb] = _CompassSubNet(
                     in_features=sub_in_dim,
+                    hidden_dims=hidden_dims,
                     linear_cls=linear_cls,
+                    task=task,
+                    n_classes=n_classes,
+                    output_activation=output_activation,
                 )
+        # store as string keys for ModuleDict
         return nn.ModuleDict({str(k): v for k, v in patterns.items()})  # type: ignore
-
-    def _route(self, x: torch.Tensor) -> Tuple[_CompassSubNet, torch.Tensor]:
-        """Return the sub-network and the *observed* slice of x for one sample."""
-        if x.dim() != 1:
-            raise ValueError("Routing expects a single sample (1-D tensor).")
-        mask = torch.isnan(x)
-        missing = mask.sum().item()
-        if missing > 2:
-            raise ValueError("COMPASS-Net instantiated for up to 2 missing inputs.")
-        key = self._mask_to_key(mask)
-        sub = self._subnets[str(key)]
-        observed_x = x[~mask]
-        return sub, observed_x
 
     def _route_batch(
         self, x: torch.Tensor, pattern_key: Tuple[int, ...]
-    ) -> Tuple[_CompassSubNet, torch.Tensor]:
-        """Return the sub-network and observed features for a batch of samples with the same missing pattern."""
+    ) -> tuple[_CompassSubNet, torch.Tensor]:
+        """Return the sub-network and observed features for a batch with the same missing pattern."""
         if x.dim() != 2:
             raise ValueError("Batch routing expects a 2-D tensor (batch, features).")
 
@@ -129,22 +156,66 @@ class _RouterMixin:
 
         # Extract observed features
         observed_x = x[:, observed_mask]
-
         return subnet, observed_x
 
 
-# -----------------------------------------------------------------------------
-# Public models ----------------------------------------------------------------
-# -----------------------------------------------------------------------------
-
+# ----------------------------------------------------------------------------- #
+# Public model
+# ----------------------------------------------------------------------------- #
 
 class COMPASSNet(nn.Module, _RouterMixin):
-    """COMPASS-Net with *plain* linear layers (expects imputed inputs or none missing)."""
+    """COMPASS-Net with variable-depth subnets and task-aware heads.
 
-    def __init__(self, in_features: int):
+    Parameters
+    ----------
+    in_features : int
+        Number of input features (full vector).
+    hidden_dims : Sequence[int], default=(4,)
+        Width of each hidden layer (shared across all sub-models).
+    task : {'binary','multiclass','regression'}, default='binary'
+        Determines the output head size and (if output_activation='auto') the head activation.
+    n_classes : int, default=2
+        Used only when task='multiclass'.
+    output_activation : {'auto','sigmoid','softmax','linear', None}, default='auto'
+        Final activation applied by each sub-model.
+    linear_cls : Type[nn.Linear], default=nn.Linear
+        Allows substituting the first linear with PROMISSING variants if desired.
+    max_missing : int, default=2
+        Maximum number of missing inputs supported (builds subnets for sizes 0..max_missing).
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_dims: Sequence[int] = (4,),
+        task: str = "binary",
+        n_classes: int = 2,
+        output_activation: str | None = "auto",
+        linear_cls: Type[nn.Linear] = nn.Linear,
+        max_missing: int = 2,
+    ):
         super().__init__()
-        self.in_features = in_features
-        self._subnets = self._build_subnets(in_features, nn.Linear)
+        self.in_features = int(in_features)
+        self.task = task
+        self.n_classes = int(n_classes)
+        self.output_activation = output_activation
+        self.max_missing = int(max_missing)
+
+        self._subnets = self._build_subnets(
+            in_features=self.in_features,
+            linear_cls=linear_cls,
+            hidden_dims=hidden_dims,
+            task=task,
+            n_classes=n_classes,
+            output_activation=output_activation,
+            pattern_sizes=tuple(range(0, self.max_missing + 1)),  # e.g. (0,1,2)
+        )
+
+        # Determine output dimension for allocating batch outputs
+        if (task or "binary").lower() in ("multiclass", "classification", "cls_multiclass"):
+            self._out_dim = int(n_classes)
+        else:
+            self._out_dim = 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 2:
@@ -158,18 +229,18 @@ class COMPASSNet(nn.Module, _RouterMixin):
 
         # Check for too many missing features
         missing_counts = missing_masks.sum(dim=1)
-        if torch.any(missing_counts > 2):
-            raise ValueError("COMPASS-Net instantiated for up to 2 missing inputs.")
+        if torch.any(missing_counts > self.max_missing):
+            raise ValueError(
+                f"COMPASS-Net instantiated for up to {self.max_missing} missing inputs."
+            )
 
-        # Convert masks to pattern strings for efficient grouping
-        # This is faster than the loop-based approach for large batches
+        # Convert masks to pattern strings and group indices
         pattern_strings = []
         for i in range(batch_size):
             mask = missing_masks[i]
-            key = self._mask_to_key(mask)
+            key = tuple(torch.nonzero(mask, as_tuple=False).squeeze(1).tolist())
             pattern_strings.append(str(key))
 
-        # Group indices by pattern using dictionary comprehension
         unique_patterns = list(set(pattern_strings))
         pattern_groups = {
             pattern: torch.tensor(
@@ -180,26 +251,24 @@ class COMPASSNet(nn.Module, _RouterMixin):
         }
 
         # Initialize output tensor
-        outputs = torch.zeros((batch_size, 1), device=device)
+        outputs = torch.zeros((batch_size, self._out_dim), device=device)
 
         # Process each pattern group in batch
         for pattern_str, indices in pattern_groups.items():
             if len(indices) == 0:
                 continue
 
-            # Convert pattern string back to tuple
-            pattern_key = eval(pattern_str)  # Safe since we control the format
+            # Convert pattern string back to tuple (safe: we control serialization)
+            pattern_key = eval(pattern_str)
 
             # Extract samples for this pattern group
             group_x = x[indices]  # (group_size, in_features)
 
-            # Use batch routing to get subnet and observed features
+            # Route to subnet and slice observed features
             subnet, observed_x = self._route_batch(group_x, pattern_key)
 
-            # Forward through subnet
-            group_outputs = subnet(observed_x)  # (group_size, 1)
-
-            # Place outputs back in correct positions
+            # Forward through subnet and place outputs back
+            group_outputs = subnet(observed_x)  # (group_size, out_dim)
             outputs[indices] = group_outputs
 
         return outputs

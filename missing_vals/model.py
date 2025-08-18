@@ -67,14 +67,20 @@ class _Net(nn.Module):
         output_activation: str = "sigmoid",
     ) -> None:
         super().__init__()
-        self.hidden = nn.Linear(input_dim, hidden_dims[0])
         self.logger = logging.getLogger(__name__)
         self.logger.debug(
             f"Net init: Input dimension: {input_dim}, Hidden dimensions: {hidden_dims}"
         )
         self.act = _get_activation(activation)
 
-        self.out = nn.Linear(hidden_dims[0], output_dim)
+        # Build multiple hidden layers based on hidden_dims tuple
+        self.hidden_layers = nn.ModuleList()
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            self.hidden_layers.append(nn.Linear(prev_dim, hidden_dim))
+            prev_dim = hidden_dim
+
+        self.out = nn.Linear(prev_dim, output_dim)
         self.out_act = _get_activation(output_activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -88,34 +94,38 @@ class _Net(nn.Module):
         if self.logger.isEnabledFor(logging.DEBUG):
             with open("input_tensor.json", "w") as f:
                 json.dump(x.cpu().numpy().tolist(), f)
-        x = self.hidden(x)
-        if torch.isnan(x).any():
-            self.logger.warning("Hidden layer output contains NaNs!")
-            raise ValueError(
-                "Hidden layer output contains NaNs, which may cause the output layer to return NaNs"
-            )
-        if self.act is not None:
-            x = self.act(x)
-        self.logger.debug(f"Net forward: After activation, tensor shape: {x.shape}")
-        if torch.isnan(x).any():
-            self.logger.warning("Activation output contains NaNs!")
-            raise ValueError(
-                "Activation output contains NaNs, which may cause the output layer to return NaNs"
-            )
+
+        # Forward through all hidden layers
+        for i, hidden_layer in enumerate(self.hidden_layers):
+            x = hidden_layer(x)
+            if torch.isnan(x).any():
+                self.logger.warning(f"Hidden layer {i+1} output contains NaNs!")
+                raise ValueError(f"Hidden layer {i+1} output contains NaNs")
+
+            # Apply activation (ReLU for first layer, no activation for second layer per paper)
+            if (
+                i == 0 and self.act is not None
+            ):  # Only apply activation to first hidden layer
+                x = self.act(x)
+                self.logger.debug(
+                    f"Net forward: After activation layer {i+1}, tensor shape: {x.shape}"
+                )
+                if torch.isnan(x).any():
+                    self.logger.warning(f"Activation output layer {i+1} contains NaNs!")
+                    raise ValueError(f"Activation output layer {i+1} contains NaNs")
+
+        # Output layer
         out = self.out(x)
         if torch.isnan(out).any():
             self.logger.warning("Output tensor contains NaNs!")
-            raise ValueError(
-                "Output tensor contains NaNs, which may cause the final output to return NaNs"
-            )
+            raise ValueError("Output tensor contains NaNs")
+
         if self.out_act is None:
             return out
         out = self.out_act(out)
         if torch.isnan(out).any():
             self.logger.warning("Output tensor contains NaNs after activation!")
-            raise ValueError(
-                "Output tensor contains NaNs after activation, which may cause the final output to return NaNs"
-            )
+            raise ValueError("Output tensor contains NaNs after activation")
         return out
 
 
@@ -131,13 +141,32 @@ class _PromissingNet(nn.Module):
         output_activation: str = "sigmoid",
     ) -> None:
         super().__init__()
+        # First layer is always PROMISSING
         self.hidden = PromissingLinear(input_dim, hidden_dims[0], bias=True)
         self.act = _get_activation(activation)
-        self.out = nn.Linear(hidden_dims[0], output_dim, bias=True)
+
+        # Build additional hidden layers if more than one specified
+        self.additional_hidden_layers = nn.ModuleList()
+        prev_dim = hidden_dims[0]
+        for hidden_dim in hidden_dims[1:]:
+            self.additional_hidden_layers.append(nn.Linear(prev_dim, hidden_dim))
+            prev_dim = hidden_dim
+
+        self.out = nn.Linear(prev_dim, output_dim, bias=True)
         self.out_act = _get_activation(output_activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # First layer (PROMISSING) with activation
         x = self.act(self.hidden(x))
+
+        # Additional hidden layers
+        for i, hidden_layer in enumerate(self.additional_hidden_layers):
+            x = hidden_layer(x)
+            # Apply activation only to first additional layer (second layer overall)
+            if i == 0 and self.act is not None:
+                x = self.act(x)
+
+        # Output layer
         x = self.out_act(self.out(x))
         return x
 
@@ -154,13 +183,32 @@ class _mPromissingNet(nn.Module):
         output_activation: str = "sigmoid",
     ) -> None:
         super().__init__()
+        # First layer is always mPROMISSING
         self.hidden = mPromissingLinear(input_dim, hidden_dims[0], bias=True)
         self.act = _get_activation(activation)
-        self.out = nn.Linear(hidden_dims[0], output_dim, bias=True)
+
+        # Build additional hidden layers if more than one specified
+        self.additional_hidden_layers = nn.ModuleList()
+        prev_dim = hidden_dims[0]
+        for hidden_dim in hidden_dims[1:]:
+            self.additional_hidden_layers.append(nn.Linear(prev_dim, hidden_dim))
+            prev_dim = hidden_dim
+
+        self.out = nn.Linear(prev_dim, output_dim, bias=True)
         self.out_act = _get_activation(output_activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # First layer (mPROMISSING) with activation
         x = self.act(self.hidden(x))
+
+        # Additional hidden layers
+        for i, hidden_layer in enumerate(self.additional_hidden_layers):
+            x = hidden_layer(x)
+            # Apply activation only to first additional layer (second layer overall)
+            if i == 0 and self.act is not None:
+                x = self.act(x)
+
+        # Output layer
         x = self.out_act(self.out(x))
         return x
 
@@ -249,6 +297,61 @@ class MissingEstimator(BaseEstimator):
     # --------------------------------------------------------------------- #
     # Internal helpers
     # --------------------------------------------------------------------- #
+    def augment_training_data(
+        self,
+        X: pd.DataFrame | np.ndarray,
+        y: pd.Series | np.ndarray,
+        augmentation_fraction: float,
+        exclude_columns: list[str] | None = None,
+        missing_cols: list[int] = [1, 2],
+        random_state: int | None = None,
+    ) -> tuple[pd.DataFrame | np.ndarray, pd.Series | np.ndarray]:
+        """
+        Create an augmented training set by injecting missing values **in training only**,
+        delegating to `utils.augment_with_missing_values`.
+
+        If `0 < augmentation_fraction < 1`, we:
+          1) concatenate X and y (as column 'target'),
+          2) call `augment_with_missing_values(..., exclude_columns=['target'])`,
+          3) split back into X_aug and y_aug.
+
+        If the fraction is not in (0,1), the original (X, y) are returned unchanged.
+        """
+        # Only act if enabled
+        try:
+            frac = float(augmentation_fraction)
+        except Exception:
+            return X, y
+        if not (0.0 < frac < 1.0):
+            return X, y
+
+        # Build a DataFrame view to pass through utils
+        if isinstance(X, np.ndarray):
+            cols = [f"x{i}" for i in range(X.shape[1])]
+            X_df = pd.DataFrame(X, columns=cols)
+        else:
+            X_df = X.copy(deep=True)
+
+        if isinstance(y, (pd.Series, pd.DataFrame)):
+            y_series = pd.Series(y).rename("target")
+        else:
+            y_series = pd.Series(y, name="target")
+
+        df = pd.concat([X_df, y_series], axis=1)
+        df_aug = augment_with_missing_values(
+            data=df,
+            augmentation_fraction=frac,
+            exclude_columns=["target"] if exclude_columns is None else list(set(["target"] + list(exclude_columns))),
+            random_state=(self.random_state if random_state is None else random_state),
+            missing_cols=missing_cols,
+        )
+
+        y_aug = df_aug.pop("target")
+        if isinstance(X, np.ndarray):
+            return df_aug.to_numpy(), y_aug.to_numpy()
+        else:
+            return df_aug, y_aug
+        
     def _set_seed(self) -> None:
         if self.random_state is not None:
             set_seed(self.random_state)
@@ -258,7 +361,7 @@ class MissingEstimator(BaseEstimator):
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def _get_imputer(self) -> None | SimpleImputer | KNNImputer | IterativeImputer:
-        if self.imputer_name in ["none", "custom", "promissing", "mpromissing"]:
+        if self.imputer_name in ["none", "custom", "promissing", "mpromissing", "compass"]:
             return None
         elif self.imputer_name == "zero":
             return SimpleImputer(strategy="constant", fill_value=0)
@@ -273,7 +376,7 @@ class MissingEstimator(BaseEstimator):
 
     def _check_X_y(self, X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Check and convert input data to the correct format."""
-        if self.imputer_name in ["none", "custom", "promissing", "mpromissing"]:
+        if self.imputer_name in ["none", "custom", "promissing", "mpromissing", "compass"]:
             X, y = check_X_y(X, y, ensure_all_finite="allow-nan")
         else:
             X, y = check_X_y(X, y, ensure_all_finite=True)
@@ -336,7 +439,7 @@ class MissingEstimator(BaseEstimator):
                 starts_ok = vmin in (0, 1)
 
                 # Special-case dense 0..20 inclusive (21 classes)
-                dense_0_to_20 = (vmin == 0 and vmax == 20 and consecutive)
+                dense_0_to_20 = vmin == 0 and vmax == 20 and consecutive
 
                 if consecutive and starts_ok:
                     if k == 2:
@@ -349,7 +452,6 @@ class MissingEstimator(BaseEstimator):
 
         # 3) Fallback
         return "regression"
-
 
     # --------------------------------------------------------------------- #
     # Scikit-learn API
@@ -373,13 +475,17 @@ class MissingEstimator(BaseEstimator):
             logging.info(f"Determined task type: {task}")
             if task == "binary_classification":
                 self.output_activation = "sigmoid"
-                logging.info("Setting output activation to 'sigmoid' for binary classification.")
+                logging.info(
+                    "Setting output activation to 'sigmoid' for binary classification."
+                )
             elif task == "regression":
                 self.output_activation = "linear"
                 logging.info("Setting output activation to 'linear' for regression.")
             elif task == "multi_class_classification":
                 self.output_activation = "softmax"
-                logging.info("Setting output activation to 'softmax' for multi-class classification.")
+                logging.info(
+                    "Setting output activation to 'softmax' for multi-class classification."
+                )
 
         # Decide whether to split validation first
         if self.early_stopping and 0.0 < self.early_stopping < 1.0:
@@ -442,6 +548,11 @@ class MissingEstimator(BaseEstimator):
                     self.activation,
                     self.output_activation,
                 ).to(device)
+            elif self.imputer_name == "compass":
+                # COMPASS-Net currently supports binary classification (sigmoid output).
+                if self.output_activation != "sigmoid":
+                    raise ValueError("imputer_name='compass' supports binary classification only (sigmoid output).")
+                self._model_ = COMPASSNet(input_dim).to(device)
             else:
                 self._model_ = _Net(
                     input_dim,
@@ -472,7 +583,30 @@ class MissingEstimator(BaseEstimator):
         elif self.output_activation == "sigmoid":
             self._unique_classes = np.array([0, 1], dtype=int)
 
-        # Build data loaders
+        
+        # If using COMPASS, expand the training (and validation) set to include
+        # all mask patterns of size 0, 1, and 2 so every sub-network gets trained.
+        if self.imputer_name == "compass":
+            import itertools
+            def _expand_patterns(X_arr, y_arr):
+                n_feat = X_arr.shape[1]
+                patterns = [()] + [(i,) for i in range(n_feat)] + list(itertools.combinations(range(n_feat), 2))
+                X_list = []
+                y_list = []
+                for patt in patterns:
+                    Xc = X_arr.copy()
+                    if len(patt) > 0:
+                        Xc[:, list(patt)] = np.nan
+                    X_list.append(Xc)
+                    y_list.append(y_arr.copy())
+                X_exp = np.vstack(X_list)
+                y_exp = np.concatenate(y_list, axis=0)
+                return X_exp, y_exp
+            X_train, y_train = _expand_patterns(X_train, y_train)
+            if has_val:
+                X_val, y_val = _expand_patterns(X_val, y_val)
+
+# Build data loaders
         if self.output_activation == "softmax":
             # Multi-class: y should be 1D LongTensor for CrossEntropyLoss
             train_ds = torch.utils.data.TensorDataset(
@@ -517,11 +651,14 @@ class MissingEstimator(BaseEstimator):
                 preds = self._model_(xb)
                 if self.logger.isEnabledFor(logging.DEBUG):
                     with open(f"last_train_batch.json", "w") as f:
-                        json.dump({
-                            "xb": xb.cpu().numpy().tolist(),
-                            "yb": yb.cpu().numpy().tolist(),
-                            "preds": preds.cpu().detach().numpy().tolist()
-                        }, f)
+                        json.dump(
+                            {
+                                "xb": xb.cpu().numpy().tolist(),
+                                "yb": yb.cpu().numpy().tolist(),
+                                "preds": preds.cpu().detach().numpy().tolist(),
+                            },
+                            f,
+                        )
                 loss = criterion(preds, yb)
                 loss.backward()
                 optimiser.step()

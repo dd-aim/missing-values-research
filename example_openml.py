@@ -181,7 +181,7 @@ if __name__ == "__main__":
         ds = datasets[ds_id]
         # Save the combined dataset as a CSV for debugging
         combined_df = pd.concat([ds.frame, ds.target.rename("target")], axis=1)
-        combined_df.to_csv("debug.csv", index=False)
+        
         logger.debug("Saved combined dataset to debug.csv")
         logger.info("✓ Datasets ready")
         task = determine_task_type(ds)  # 'classification' / 'regression'
@@ -238,4 +238,6 @@ if __name__ == "__main__":
                     logger.info(f"      ROC-AUC  : {pretty_stats(stats['auc'])}")
                 else:
                     logger.info(f"      R² score : {pretty_stats(stats['r2'])}")
+
+
         
