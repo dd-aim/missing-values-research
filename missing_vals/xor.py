@@ -19,7 +19,7 @@ from sklearn.utils.validation import check_is_fitted
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import SimpleImputer, KNNImputer, IterativeImputer
 
-from .utils import set_seed, augment_with_missing_values
+from .utils import set_seed
 from .promissing import PromissingLinear, mPromissingLinear
 from .compass_net import COMPASSNet
 

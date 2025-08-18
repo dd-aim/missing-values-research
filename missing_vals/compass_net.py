@@ -6,20 +6,12 @@ COMPASS-Net (COMbinatorial PAttern Sub-modelS Network)
 - Variable-depth sub-models: hidden_dims=(...) builds stacked hidden layers
 - max_missing controls the largest missing-feature mask handled at inference
 """
-# TODO: Given an input [A,B,C,D] and a batch [[A1,B1,C1,D1], [A2,B2,NaN,D2], [NaN,B3,C3,D3], [A4,B4,C4,NaN3], [A5,B5,C5,D5]]
-# The model must train all possible sub-models for missing patterns:
-# - [A,B,C,D] -> full model + all missing patterns models
-# - [A2,B2,NaN,D2] -> all missing patterns models that they not include C
-# - [NaN,B3,C3,D3] -> all missing patterns models that they not include A
-# - [A4,B4,NaN,D4] -> all missing patterns models that they not include C
-# - [A5,B5,C5,D5] -> full model + all missing patterns models
-
 from __future__ import annotations
 
 import itertools
-from typing import Dict, Iterable, Tuple, Type, Sequence, Optional
-import logging
 from itertools import combinations
+import logging
+from typing import Dict, Iterable, Tuple, Type, Sequence, Optional
 
 import numpy as np
 import pandas as pd
@@ -27,92 +19,173 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-# Module logger
 logger = logging.getLogger(__name__)
-
 
 # ----------------------------------------------------------------------------- #
 # Data Preprocessing for Compass training
 # ----------------------------------------------------------------------------- #
-def augment_with_missing_values(
-    data: pd.DataFrame,
-    missing_cols: list = [1, 2],
-) -> pd.DataFrame:
+
+
+
+
+
+def compass_expand_patterns(
+    data: pd.DataFrame | np.ndarray,
+    y: Optional[pd.Series | pd.DataFrame | np.ndarray] = None,
+    missing_cols: Iterable[int] = (1, 2),
+):
     """
-    Augment a DataFrame by introducing missing values with different patterns.
+    Augment X by introducing missing values with different patterns, and replicate y accordingly.
+
+    Supports both pandas and NumPy inputs. If `y` is provided, returns a tuple (X_aug, y_aug).
+    If `y` is None, returns only X_aug.
 
     Args:
-        data (pd.DataFrame): The input DataFrame.
-        augmentation_fraction (float): Fraction of rows to augment with missing values.
-        exclude_columns (list): Columns to exclude from augmentation.
-        random_state (int): Seed for reproducibility.
-        missing_cols (list): List specifying number of columns to make missing simultaneously:
+        data: Feature matrix X as a pandas DataFrame or NumPy array. If array, it will be
+              converted to a DataFrame internally for processing.
+        y: Target vector/array as pandas Series/DataFrame or NumPy array. If provided, it will be
+           replicated and filtered to stay aligned with augmented samples.
+        missing_cols: Iterable specifying how many columns to set missing simultaneously:
             - 1: Single column missing (one column at a time)
             - 2: Every combination of 2 columns missing
             - 3: Every combination of 3 columns missing
             - etc.
 
     Returns:
-        pd.DataFrame: Augmented DataFrame with missing values following specified patterns.
+        If y is provided: (X_aug, y_aug) with the same types as the inputs (DataFrame/Series or ndarray).
+        If y is None: X_aug with the same type as the input `data`.
     """
-    if exclude_columns is None:
-        exclude_columns = []
-    elif isinstance(exclude_columns, str):
-        exclude_columns = [exclude_columns]
-    elif not isinstance(exclude_columns, list):
-        raise TypeError("exclude_columns must be a list or a string")
+    # Normalize X to DataFrame for processing while tracking original types
+    x_was_numpy = isinstance(data, np.ndarray)
+    if x_was_numpy:
+        X_df = pd.DataFrame(data)
+    elif isinstance(data, pd.DataFrame):
+        X_df = data.copy()
+    else:
+        raise TypeError("Input X must be a pandas DataFrame or NumPy array")
 
-    if data.empty:
-        logger.error("Input DataFrame is empty")
-        raise ValueError("Input DataFrame is empty")
+    if X_df.empty:
+        raise ValueError("Input X is empty")
 
-    # Get eligible columns for augmentation
-    eligible_columns = [col for col in data.columns if col not in exclude_columns]
+    # Normalize y to pandas object if provided and track shape/type
+    y_provided = y is not None
+    if y_provided:
+        y_was_numpy = isinstance(y, np.ndarray)
+        if y_was_numpy:
+            if y.ndim == 1:
+                y_pd: pd.Series | pd.DataFrame = pd.Series(y)
+                y_is_1d = True
+            elif y.ndim == 2 and y.shape[1] == 1:
+                y_pd = pd.DataFrame(y)
+                y_is_1d = False
+            else:
+                # multi-output not supported in this helper
+                raise ValueError("y with shape != (n,) or (n,1) is not supported")
+        elif isinstance(y, (pd.Series, pd.DataFrame)):
+            y_pd = y.copy()
+            y_is_1d = isinstance(y_pd, pd.Series)
+        else:
+            raise TypeError("y must be a pandas Series/DataFrame or NumPy array")
 
-    if not eligible_columns:
-        logger.error("No eligible columns found for augmentation.")
-        raise ValueError("No eligible columns found for augmentation.")
-    
-    augmented_samples = []
-    
-    for missing_idx, num_missing in enumerate(missing_cols):
+        if len(y_pd) != len(X_df):
+            raise ValueError(
+                f"Length mismatch: X has {len(X_df)} rows but y has {len(y_pd)}"
+            )
+        # Align indices
+        y_pd.index = X_df.index
+
+    # Validate missing sizes (k): allow 1..n_cols-1
+    n_cols = X_df.shape[1]
+    try:
+        k_values = sorted({int(k) for k in missing_cols})
+    except Exception as e:
+        raise TypeError("missing_cols must be an iterable of integers") from e
+
+    valid_k = [k for k in k_values if 1 <= k < n_cols]
+    if not valid_k:
+        logger.warning(
+            "No valid missing sizes in missing_cols=%s for %d columns. Returning original data.",
+            list(k_values),
+            n_cols,
+        )
+        if y_provided:
+            return (data if x_was_numpy else X_df, y)
+        return data if x_was_numpy else X_df
+
+    columns = list(X_df.columns)
+    augmented_X: list[pd.DataFrame] = []
+    augmented_y: list[pd.Series | pd.DataFrame] = [] if y_provided else []
+
+    def _append_aug(aug_sample: pd.DataFrame):
+        if not aug_sample.empty:
+            augmented_X.append(aug_sample)
+            if y_provided:
+                augmented_y.append(y_pd.loc[aug_sample.index])  # type: ignore[name-defined]
+
+    # Generate augmentations
+    for num_missing in valid_k:
         if num_missing == 1:
-            for i, column in enumerate(eligible_columns):
-                mask = data[column].notna()
-                aug_sample = data[mask].copy()
-                aug_sample[column] = np.nan
-                other_cols = [col for col in eligible_columns if col != column]
+            for col in columns:
+                mask = X_df[col].notna()
+                if not mask.any():
+                    continue
+                aug_sample = X_df.loc[mask].copy()
+                aug_sample[col] = np.nan
+                other_cols = [c for c in columns if c != col]
                 if other_cols:
-                    aug_sample = aug_sample.dropna(subset=other_cols)
-                if not aug_sample.empty:
-                    logger.debug(
-                        f"Augmented sample for column {column}, rows: {len(aug_sample)}"
-                    )
-                    augmented_samples.append(aug_sample)
-        elif num_missing >= 2 and num_missing < len(eligible_columns):
-            column_combinations = list(combinations(eligible_columns, num_missing))
-            for combo_idx, missing_column_combo in enumerate(column_combinations):
-                mask = data[list(missing_column_combo)].notna().all(axis=1)
-                aug_sample = data[mask].copy()
-                for col in missing_column_combo:
-                    aug_sample[col] = np.nan
-                other_cols = [
-                    col for col in eligible_columns if col not in missing_column_combo
-                ]
+                    aug_sample.dropna(subset=other_cols, inplace=True)
+                _append_aug(aug_sample)
+        else:
+            for combo in combinations(columns, num_missing):
+                combo = list(combo)
+                mask = X_df[combo].notna().all(axis=1)
+                if not mask.any():
+                    continue
+                aug_sample = X_df.loc[mask].copy()
+                for c in combo:
+                    aug_sample[c] = np.nan
+                other_cols = [c for c in columns if c not in combo]
                 if other_cols:
-                    aug_sample = aug_sample.dropna(subset=other_cols)
-                if not aug_sample.empty:
-                    logger.debug(
-                        f"Augmented sample for columns {missing_column_combo}, rows: {len(aug_sample)}"
-                    )
-                    augmented_samples.append(aug_sample)
-    if augmented_samples:
-        logger.info(f"Created {len(augmented_samples)} augmented samples.")
-        result = pd.concat([data] + augmented_samples, axis=0, ignore_index=True)
-        return result.reset_index(drop=True)
+                    aug_sample.dropna(subset=other_cols, inplace=True)
+                _append_aug(aug_sample)
+
+    # Stack originals + augmentations (if any)
+    if augmented_X:
+        logger.info("Created %d augmented samples.", len(augmented_X))
+        X_all = pd.concat([X_df] + augmented_X, axis=0, ignore_index=False)
+        if y_provided:
+            y_all = pd.concat([y_pd] + augmented_y, axis=0, ignore_index=False)  # type: ignore[name-defined]
     else:
         logger.warning("No augmented samples created. Returning original data.")
-        return data
+        X_all = X_df
+        if y_provided:
+            y_all = y_pd  # type: ignore[name-defined]
+
+    # Clean indices
+    X_all = X_all.reset_index(drop=True)
+    if y_provided:
+        y_all = y_all.reset_index(drop=True)  # type: ignore[name-defined]
+
+    # Preserve original types on return
+    if y_provided:
+        X_ret = X_all.to_numpy() if x_was_numpy else X_all
+        if y_was_numpy:  # type: ignore[name-defined]
+            y_np = y_all.to_numpy()  # type: ignore[name-defined]
+            # Restore original ndim: (n,) or (n,1)
+            if isinstance(y, np.ndarray) and y.ndim == 1 and y_np.ndim != 1:
+                y_np = y_np.reshape(-1)
+            if (
+                isinstance(y, np.ndarray)
+                and y.ndim == 2
+                and y.shape[1] == 1
+                and y_np.ndim == 1
+            ):
+                y_np = y_np.reshape(-1, 1)
+            return X_ret, y_np
+        else:
+            return X_ret, y_all  # type: ignore[return-value]
+    else:
+        return X_all.to_numpy() if x_was_numpy else X_all
 
 
 # ----------------------------------------------------------------------------- #

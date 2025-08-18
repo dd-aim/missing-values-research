@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Union
+import os
 import numpy as np
 import pandas as pd
 import logging
+from tqdm import tqdm
 
 from .model import MissingEstimator
 from .missingness import apply_missingness
-from .utils import augment_with_missing_values
 
 # Module logger
 logger = logging.getLogger(__name__)
@@ -42,6 +43,19 @@ def _validate_fractions(fracs: Sequence[float]) -> List[float]:
     return out
 
 
+def _flatten_agg_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Flatten MultiIndex columns produced by .agg(['mean','std']) and
+    strip the 'metric_' prefix."""
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [
+            "_".join([c for c in col if c]) if isinstance(col, tuple) else str(col)
+            for col in df.columns
+        ]
+    # Clean names like 'metric_accuracy_mean' -> 'accuracy_mean'
+    rename = {c: c.replace("metric_", "") for c in df.columns}
+    return df.rename(columns=rename)
+
+
 def run_missing_benchmark(
     X_train: Union[pd.DataFrame, np.ndarray],
     y_train: Union[pd.Series, np.ndarray],
@@ -50,27 +64,33 @@ def run_missing_benchmark(
     fractions: Sequence[float],
     mechanisms: Sequence[str],
     n_runs: int = 5,
-    data_augmentation: float = 0.0,
     imputers: Optional[Sequence[str]] = None,
     estimator_kwargs: Optional[Dict] = None,
     random_state: int = 42,
+    *,
+    dataset_name: str,
+    results_root: str = "results",
 ) -> pd.DataFrame:
-    """Benchmark MissingEstimator across MCAR/MAR/MNAR test corruptions.
+    """Benchmark MissingEstimator across MCAR/MAR/MNAR corruptions with incremental saves.
 
-    For each run:
-      • Optionally augment the *training* data if 0 < data_augmentation < 1
-        using the estimator's augmentation wrapper (which delegates to utils).
-      • Train one model per imputer and compute a baseline on the clean test.
-      • For each (mechanism, fraction) pair, corrupt a fresh copy of BOTH the
-        training and test sets; refit a fresh model on the corrupted training
-        set and score on the correspondingly corrupted test set.
+    Loop order: mechanism → fraction → imputer → run
+
+    For each (mechanism, fraction), we run all imputers across 'n_runs',
+    aggregate mean/std per metric per imputer, and immediately write a CSV:
+        results/{dataset_name}/{mechanism}/{dataset_name}_{mechanism}_{fraction:.2f}.csv
+
+    Additionally, we compute a dataset-level BASELINE on clean data (train on
+    clean X_train, score on clean X_test), aggregated once per imputer across runs,
+    and include those baseline rows in EVERY per-fraction CSV. The returned DataFrame
+    includes baseline rows ONCE (mechanism='BASELINE', fraction=0.0), plus one row
+    per imputer for each (mechanism, fraction).
 
     Returns
     -------
     pd.DataFrame
-        Aggregated mean ± std metrics per (imputer, mechanism, fraction).
-        Columns are:
+        Aggregated mean ± std metrics with columns:
           ['imputer','mechanism','fraction', '<metric>_mean','<metric>_std', ...]
+        Includes one baseline row per imputer (mechanism='BASELINE', fraction=0.0).
     """
     if imputers is None:
         imputers = DEFAULT_IMPUTERS
@@ -79,67 +99,109 @@ def run_missing_benchmark(
     estimator_kwargs = dict(estimator_kwargs or {})
 
     logger.info(
-        "Starting benchmark: runs=%d, imputers=%s, mechanisms=%s, fractions=%s, augmentation=%.3f",
+        "Starting benchmark: runs=%d, imputers=%s, mechanisms=%s, fractions=%s",
         n_runs,
         list(imputers),
         list(mechanisms),
         list(map(float, fractions)),
-        float(data_augmentation),
     )
 
-    runs_rows: List[dict] = []
+    # Prepare output directories
+    root_dir = os.path.join(results_root, str(dataset_name))
+    os.makedirs(root_dir, exist_ok=True)
+    for mech in mechanisms:
+        os.makedirs(os.path.join(root_dir, mech), exist_ok=True)
+
+    # ---------- 1) Compute dataset-level BASELINE once per imputer across runs ----------
+    baseline_rows: List[dict] = []
+    metric_cols: Optional[List[str]] = None
 
     for run in range(int(n_runs)):
         base_seed = int(random_state) + run
-        logger.debug("Run %d with base_seed=%d", run, base_seed)
-
-        # Optionally augment the training set once per run
-        Xtr_aug, ytr_aug = X_train, y_train
-        use_aug = 0.0 < float(data_augmentation) < 1.0
-        if use_aug:
-            logger.info(
-                "Data augmentation enabled (fraction=%.3f)",
-                float(data_augmentation),
-            )
-            Xtr_aug, ytr_aug = augment_with_missing_values(
-                X=X_train,
-                y=y_train,
-                augmentation_fraction=float(data_augmentation),
-                exclude_columns=None,
-                random_state=base_seed,
-            )
-            logger.debug(
-                "Augmented training set shapes: X=%s, y=%s",
-                getattr(Xtr_aug, "shape", None),
-                getattr(ytr_aug, "shape", None),
-            )
+        logger.debug("Baseline run %d with base_seed=%d", run, base_seed)
 
         for imp in imputers:
-            logger.info("Training imputer='%s' on run=%d", imp, run)
+            logger.info("Baseline: training imputer='%s' on run=%d", imp, run)
             est = MissingEstimator(
                 **{**dict(imputer_name=imp, random_state=base_seed), **estimator_kwargs}
             )
             try:
-                est.fit(Xtr_aug, ytr_aug)
-                # Baseline on clean test
+                est.fit(X_train, y_train)
                 base_scores = est.score(X_test, y_test)
-                runs_rows.append(
+                row = dict(
+                    run=run,
+                    imputer=imp,
+                    mechanism="BASELINE",
+                    fraction=0.0,
+                    **{f"metric_{k}": v for k, v in base_scores.items()},
+                )
+                baseline_rows.append(row)
+
+                if metric_cols is None:
+                    metric_cols = [f"metric_{k}" for k in base_scores.keys()]
+                    logger.debug("Detected metric columns: %s", metric_cols)
+
+            except Exception as e:
+                logger.warning(
+                    "Skipping baseline for imputer='%s' on run=%d due to error: %s",
+                    imp,
+                    run,
+                    e,
+                )
+                # Record error row; will be excluded from aggregation
+                baseline_rows.append(
                     dict(
                         run=run,
                         imputer=imp,
-                        mechanism="BASELINE",
-                        fraction=0.0,
-                        **{f"metric_{k}": v for k, v in base_scores.items()},
+                        mechanism="ERROR",
+                        fraction=np.nan,
+                        metric_error=str(e),
                     )
                 )
-                logger.debug("Baseline scores for %s: %s", imp, base_scores)
 
-                # Refit on corrupted train and score on corrupted test for each scenario
-                for mech in mechanisms:
-                    for frac in fractions:
-                        seed = base_seed + hash((mech, float(frac), imp)) % 10_000_000
+    baseline_df = pd.DataFrame(baseline_rows)
+    if baseline_df.empty or (metric_cols is None):
+        logger.warning(
+            "No successful baseline runs detected; continuing without baselines."
+        )
+        baseline_agg = pd.DataFrame(columns=["imputer", "mechanism", "fraction"])
+    else:
+        # Filter out errors and aggregate by imputer
+        base_ok = baseline_df[baseline_df["mechanism"] != "ERROR"]
+        baseline_agg = (
+            base_ok.groupby(["imputer"], as_index=False)[metric_cols]
+            .agg(["mean", "std"])
+            .pipe(_flatten_agg_columns)
+        )
+        baseline_agg.insert(1, "mechanism", "BASELINE")
+        baseline_agg.insert(2, "fraction", 0.0)
+
+    # Keep a copy to reuse in each CSV
+    baseline_for_csv = baseline_agg.copy()
+
+    # ---------- 2) For each (mechanism, fraction): run, aggregate, and SAVE ----------
+    all_agg_parts: List[pd.DataFrame] = []
+    if not baseline_agg.empty:
+        # Only add baseline once to the *returned* DataFrame
+        all_agg_parts.append(baseline_agg)
+
+    # Progress bar: count only scenario model trainings (exclude baseline as per requested total)
+    total_models = len(mechanisms) * len(fractions) * int(n_runs) * len(list(imputers))
+    with tqdm(
+        total=total_models, desc=f"Benchmark {dataset_name}", unit="model"
+    ) as pbar:
+        for mech in mechanisms:
+            for frac in fractions:
+                logger.info("Processing mechanism=%s, fraction=%.2f", mech, float(frac))
+
+                scenario_rows: List[dict] = []
+                for imp in imputers:
+                    for run in range(int(n_runs)):
+                        base_seed = int(random_state) + run
+                        seed = base_seed + (hash((mech, float(frac), imp)) % 10_000_000)
                         logger.debug(
-                            "Refit+Score imputer='%s', mechanism=%s, fraction=%.2f, seed=%d",
+                            "Run=%d, imputer=%s, mech=%s, frac=%.2f, seed=%d",
+                            run,
                             imp,
                             mech,
                             float(frac),
@@ -152,27 +214,31 @@ def run_missing_benchmark(
                                 fraction=float(frac),
                                 mechanism=mech,
                                 random_state=seed,
-                                # provide y for MI-based single-column selection (MAR/MNAR)
-                                y=y_test,
+                                y=y_test,  # for MAR/MNAR helpers if needed
                             )
-                            # Corrupt training (use different seed to avoid identical mask)
+                            # Corrupt training (different seed)
                             X_train_cor = apply_missingness(
-                                Xtr_aug,
+                                X_train,
                                 fraction=float(frac),
                                 mechanism=mech,
                                 random_state=seed + 1,
-                                y=ytr_aug,
+                                y=y_train,
                             )
-                            # Refit a fresh estimator on the corrupted training set
+                            # Refit estimator on corrupted training
                             est_refit = MissingEstimator(
                                 **{
                                     **dict(imputer_name=imp, random_state=seed),
                                     **estimator_kwargs,
                                 }
                             )
-                            est_refit.fit(X_train_cor, ytr_aug)
+                            est_refit.fit(X_train_cor, y_train)
                             scores = est_refit.score(X_test_cor, y_test)
-                            runs_rows.append(
+
+                            if metric_cols is None:
+                                metric_cols = [f"metric_{k}" for k in scores.keys()]
+                                logger.debug("Detected metric columns: %s", metric_cols)
+
+                            scenario_rows.append(
                                 dict(
                                     run=run,
                                     imputer=imp,
@@ -190,7 +256,8 @@ def run_missing_benchmark(
                                 float(frac),
                                 ex,
                             )
-                            runs_rows.append(
+                            # Record error row for traceability; excluded from aggregation
+                            scenario_rows.append(
                                 dict(
                                     run=run,
                                     imputer=imp,
@@ -199,48 +266,79 @@ def run_missing_benchmark(
                                     metric_error=str(ex),
                                 )
                             )
-                            continue
-            except Exception as e:
-                logger.warning(
-                    "Skipping imputer='%s' on run=%d due to error: %s", imp, run, e
-                )
-                runs_rows.append(
-                    dict(
-                        run=run,
-                        imputer=imp,
-                        mechanism="ERROR",
-                        fraction=np.nan,
-                        metric_error=str(e),
+                        finally:
+                            # +1 per model attempt (keeps bar consistent with requested total)
+                            pbar.update(1)
+
+                scenario_df = pd.DataFrame(scenario_rows)
+                if scenario_df.empty or (metric_cols is None):
+                    logger.warning(
+                        "No successful runs for mechanism=%s, fraction=%.2f; saving baseline only.",
+                        mech,
+                        float(frac),
                     )
+                    agg_this = pd.DataFrame(
+                        columns=["imputer", "mechanism", "fraction"]
+                    )
+                else:
+                    ok = scenario_df[scenario_df["mechanism"] != "ERROR"]
+                    if ok.empty:
+                        logger.warning(
+                            "All runs failed for mechanism=%s, fraction=%.2f; saving baseline only.",
+                            mech,
+                            float(frac),
+                        )
+                        agg_this = pd.DataFrame(
+                            columns=["imputer", "mechanism", "fraction"]
+                        )
+                    else:
+                        agg_this = (
+                            ok.groupby(["imputer"], as_index=False)[metric_cols]
+                            .agg(["mean", "std"])
+                            .pipe(_flatten_agg_columns)
+                        )
+                        agg_this.insert(1, "mechanism", mech)
+                        agg_this.insert(2, "fraction", float(frac))
+
+                        # Add to overall return (without duplicating baseline here)
+                        all_agg_parts.append(agg_this)
+
+                # Build CSV content: BASELINE rows + current (mech, frac) rows
+                csv_df = pd.concat(
+                    [baseline_for_csv, agg_this],
+                    ignore_index=True,
+                    sort=False,
                 )
-                continue
 
-    runs_df = pd.DataFrame(runs_rows)
+                # Order columns: imputer, mechanism, fraction, then metrics alphabetically for stability
+                fixed_cols = ["imputer", "mechanism", "fraction"]
+                metric_order = sorted(
+                    [c for c in csv_df.columns if c not in fixed_cols]
+                )
+                csv_df = csv_df[fixed_cols + metric_order]
 
-    # Identify metric columns
-    metric_cols = [c for c in runs_df.columns if c.startswith("metric_")]
-    # Filter out error rows for aggregation
-    agg_input = runs_df[runs_df["mechanism"] != "ERROR"]
+                # Save immediately
+                mech_dir = os.path.join(root_dir, mech)
+                os.makedirs(mech_dir, exist_ok=True)
+                frac_str = f"{float(frac):.2f}"
+                filename = f"{dataset_name}_{mech}_{frac_str}.csv"
+                out_path = os.path.join(mech_dir, filename)
+                csv_df.to_csv(out_path, index=False)
+                logger.info("Saved results to %s", out_path)
 
-    if agg_input.empty:
-        logger.warning("No successful runs to aggregate; returning empty DataFrame.")
-        return agg_input
+    # ---------- 3) Build final return DataFrame ----------
+    if not all_agg_parts:
+        logger.warning("No successful aggregations; returning empty DataFrame.")
+        return pd.DataFrame()
 
-    # Aggregate mean/std by imputer, mechanism, fraction
-    agg = agg_input.groupby(["imputer", "mechanism", "fraction"], as_index=False)[
-        metric_cols
-    ].agg(["mean", "std"])
-    # Flatten columns
-    agg.columns = [
-        "_".join([c for c in col if c]) if isinstance(col, tuple) else col
-        for col in agg.columns
-    ]
-    # Clean names like 'metric_accuracy_mean' -> 'accuracy_mean'
-    rename = {c: c.replace("metric_", "") for c in agg.columns}
-    agg = agg.rename(columns=rename)
+    final_df = pd.concat(all_agg_parts, ignore_index=True, sort=False)
+    # Normalize column order in the return value as well
+    fixed_cols = ["imputer", "mechanism", "fraction"]
+    metric_order = sorted([c for c in final_df.columns if c not in fixed_cols])
+    final_df = final_df[fixed_cols + metric_order]
 
-    logger.info("Benchmark complete. Aggregated rows: %d", len(agg))
-    return agg
+    logger.info("Benchmark complete. Aggregated rows: %d", len(final_df))
+    return final_df
 
 
 if __name__ == "__main__":
@@ -265,7 +363,7 @@ if __name__ == "__main__":
     def split_xy_from_df(
         df: pd.DataFrame,
         target_col: str = "target",
-        test_size: float = 0.3,
+        test_size: float = 0.5,
         seed: int = 0,
     ):
         y = df[target_col].to_numpy()
@@ -279,7 +377,7 @@ if __name__ == "__main__":
     def split_xy_from_arrays(
         X: Union[pd.DataFrame, np.ndarray],
         y: Union[pd.Series, np.ndarray],
-        test_size: float = 0.3,
+        test_size: float = 0.5,
         seed: int = 0,
     ):
         y_arr = pd.Series(y).to_numpy()
@@ -293,7 +391,7 @@ if __name__ == "__main__":
     fractions = [0.1, 0.3, 0.5]
     mechanisms = ["MCAR", "MAR", "MNAR"]
     base_estimator_kwargs = dict(
-        epochs=5, batch_size=32, hidden_dims=(8,), verbose=False
+        epochs=5, batch_size=32, hidden_dims=(4,), verbose=False
     )
     results_dir = Path("results")
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -301,7 +399,7 @@ if __name__ == "__main__":
     # 1) XOR dataset (binary classification)
     xor_df = generate_xor(n_samples=2000, noise_var=0.25, random_state=0)
     X_tr, y_tr, X_te, y_te = split_xy_from_df(
-        xor_df, target_col="target", test_size=0.3, seed=0
+        xor_df, target_col="target", test_size=0.5, seed=0
     )
     # Explicitly set binary head to avoid 'auto' warnings
     estimator_kwargs_xor = {
@@ -316,8 +414,7 @@ if __name__ == "__main__":
         y_test=y_te,
         fractions=fractions,
         mechanisms=mechanisms,
-        n_runs=1,
-        data_augmentation=0.0,
+        n_runs=5,
         imputers=None,  # keep it simple for debugging
         estimator_kwargs=estimator_kwargs_xor,
         random_state=0,

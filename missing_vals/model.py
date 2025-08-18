@@ -30,9 +30,9 @@ from sklearn.metrics import (
     mean_absolute_error,
 )
 
-from .utils import set_seed, augment_with_missing_values
+from .utils import set_seed
 from .promissing import PromissingLinear, mPromissingLinear
-from .compass_net import COMPASSNet
+from .compass_net import COMPASSNet, compass_expand_patterns
 import json
 import logging
 
@@ -307,65 +307,6 @@ class MissingEstimator(BaseEstimator):
     # --------------------------------------------------------------------- #
     # Internal helpers
     # --------------------------------------------------------------------- #
-    def augment_training_data(
-        self,
-        X: pd.DataFrame | np.ndarray,
-        y: pd.Series | np.ndarray,
-        augmentation_fraction: float,
-        exclude_columns: list[str] | None = None,
-        missing_cols: list[int] = [1, 2],
-        random_state: int | None = None,
-    ) -> tuple[pd.DataFrame | np.ndarray, pd.Series | np.ndarray]:
-        """
-        Create an augmented training set by injecting missing values **in training only**,
-        delegating to `utils.augment_with_missing_values`.
-
-        If `0 < augmentation_fraction < 1`, we:
-          1) concatenate X and y (as column 'target'),
-          2) call `augment_with_missing_values(..., exclude_columns=['target'])`,
-          3) split back into X_aug and y_aug.
-
-        If the fraction is not in (0,1), the original (X, y) are returned unchanged.
-        """
-        # Only act if enabled
-        try:
-            frac = float(augmentation_fraction)
-        except Exception:
-            return X, y
-        if not (0.0 < frac < 1.0):
-            return X, y
-
-        # Build a DataFrame view to pass through utils
-        if isinstance(X, np.ndarray):
-            cols = [f"x{i}" for i in range(X.shape[1])]
-            X_df = pd.DataFrame(X, columns=cols)
-        else:
-            X_df = X.copy(deep=True)
-
-        if isinstance(y, (pd.Series, pd.DataFrame)):
-            y_series = pd.Series(y).rename("target")
-        else:
-            y_series = pd.Series(y, name="target")
-
-        df = pd.concat([X_df, y_series], axis=1)
-        df_aug = augment_with_missing_values(
-            data=df,
-            augmentation_fraction=frac,
-            exclude_columns=(
-                ["target"]
-                if exclude_columns is None
-                else list(set(["target"] + list(exclude_columns)))
-            ),
-            random_state=(self.random_state if random_state is None else random_state),
-            missing_cols=missing_cols,
-        )
-
-        y_aug = df_aug.pop("target")
-        if isinstance(X, np.ndarray):
-            return df_aug.to_numpy(), y_aug.to_numpy()
-        else:
-            return df_aug, y_aug
-
     def _set_seed(self) -> None:
         if self.random_state is not None:
             set_seed(self.random_state)
@@ -627,7 +568,6 @@ class MissingEstimator(BaseEstimator):
                 ).to(device)
                 self.logger.info("Built model: _mPromissingNet in_dim=%d", input_dim)
             elif self.imputer_name == "compass":
-                # COMPASS-Net currently supports binary classification (sigmoid output).
                 self._model_ = COMPASSNet(input_dim).to(device)
                 self.logger.info("Built model: COMPASSNet in_dim=%d", input_dim)
             else:
@@ -664,30 +604,16 @@ class MissingEstimator(BaseEstimator):
         # If using COMPASS, expand the training (and validation) set to include
         # all mask patterns of size 0, 1, and 2 so every sub-network gets trained.
         if self.imputer_name == "compass":
-            import itertools
-
-            def _expand_patterns(X_arr, y_arr):
-                n_feat = X_arr.shape[1]
-                patterns = (
-                    [()]
-                    + [(i,) for i in range(n_feat)]
-                    + list(itertools.combinations(range(n_feat), 2))
-                )
-                X_list = []
-                y_list = []
-                for patt in patterns:
-                    Xc = X_arr.copy()
-                    if len(patt) > 0:
-                        Xc[:, list(patt)] = np.nan
-                    X_list.append(Xc)
-                    y_list.append(y_arr.copy())
-                X_exp = np.vstack(X_list)
-                y_exp = np.concatenate(y_list, axis=0)
-                return X_exp, y_exp
-
-            X_train, y_train = _expand_patterns(X_train, y_train)
+            # Expand the training (and validation) set to include
+            # all mask patterns of size 1 and 2 (and 0 implicitly by including originals),
+            # ensuring alignment between X and y and filtering unusable rows.
+            X_train, y_train = compass_expand_patterns(
+                X_train, y_train
+            )
             if has_val:
-                X_val, y_val = _expand_patterns(X_val, y_val)
+                X_val, y_val = compass_expand_patterns(
+                    X_val, y_val
+                )
             self.logger.debug(
                 "Expanded training for COMPASS: X=%s, y=%s",
                 X_train.shape,
