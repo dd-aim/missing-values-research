@@ -12,6 +12,7 @@ import itertools
 from itertools import combinations
 import logging
 from typing import Dict, Iterable, Tuple, Type, Sequence, Optional
+import ast
 
 import numpy as np
 import pandas as pd
@@ -226,6 +227,9 @@ class _CompassSubNet(nn.Module):
         - regression: Linear -> (no activation) or 'linear'
         - binary:     Linear(->1) -> Sigmoid if required
         - multiclass: Linear(->n_classes) -> Softmax if required
+
+    NOTE: During training we should return logits; final activation is applied
+    externally (e.g., in predict_proba) when needed.
     """
 
     def __init__(
@@ -259,22 +263,15 @@ class _CompassSubNet(nn.Module):
             out_dim = 1
 
         self.out = nn.Linear(prev, out_dim, bias=True)
+        # Store but do NOT apply in forward; keep logits
         self._final_act = _resolve_activation(task_l, output_activation)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore
         for layer in self.hidden_layers:
             x = torch.tanh(layer(x))
         x = self.out(x)
-        # Apply head activation if requested
-        if self._final_act == "sigmoid":
-            return torch.sigmoid(x)
-        elif self._final_act == "softmax":
-            return torch.softmax(x, dim=-1)
-        elif self._final_act in ("linear", None):
-            return x
-        else:
-            # Fallback: no activation
-            return x
+        # Return logits (no activation) for loss compatibility
+        return x
 
 
 # ----------------------------------------------------------------------------- #
@@ -364,7 +361,7 @@ class COMPASSNet(nn.Module, _RouterMixin):
     n_classes : int, default=2
         Used only when task='multiclass'.
     output_activation : {'auto','sigmoid','softmax','linear', None}, default='auto'
-        Final activation applied by each sub-model.
+        Final activation applied by each sub-model. Not applied during forward; stored for reference.
     linear_cls : Type[nn.Linear], default=nn.Linear
         Allows substituting the first linear with PROMISSING variants if desired.
     max_missing : int, default=2
@@ -462,8 +459,8 @@ class COMPASSNet(nn.Module, _RouterMixin):
             if len(indices) == 0:
                 continue
 
-            # Convert pattern string back to tuple (safe: we control serialization)
-            pattern_key = eval(pattern_str)
+            # Convert pattern string back to tuple safely
+            pattern_key = ast.literal_eval(pattern_str)
 
             # Extract samples for this pattern group
             group_x = x[indices]  # (group_size, in_features)
@@ -471,7 +468,7 @@ class COMPASSNet(nn.Module, _RouterMixin):
             # Route to subnet and slice observed features
             subnet, observed_x = self._route_batch(group_x, pattern_key)
 
-            # Forward through subnet and place outputs back
+            # Forward through subnet and place logits back
             group_outputs = subnet(observed_x)  # (group_size, out_dim)
             outputs[indices] = group_outputs
 

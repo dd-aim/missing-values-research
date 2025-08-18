@@ -38,7 +38,7 @@ import logging
 
 
 def _get_activation(name: str) -> nn.Module:
-    """Get an activation function by name."""
+    """Get an activation function by name (hidden layers only)."""
     activations = {
         "tanh": nn.Tanh(),
         "relu": nn.ReLU(),
@@ -48,7 +48,6 @@ def _get_activation(name: str) -> nn.Module:
         "selu": nn.SELU(),
         "softmax": nn.Softmax(dim=-1),
     }
-    # Normalize the key once
     key = name.strip().lower() if isinstance(name, str) else name
     if key == "linear":
         return None
@@ -58,7 +57,7 @@ def _get_activation(name: str) -> nn.Module:
 
 
 class _Net(nn.Module):
-    """MLP network"""
+    """MLP network returning logits; no final activation in forward."""
 
     def __init__(
         self,
@@ -75,7 +74,6 @@ class _Net(nn.Module):
         )
         self.act = _get_activation(activation)
 
-        # Build multiple hidden layers based on hidden_dims tuple
         self.hidden_layers = nn.ModuleList()
         prev_dim = input_dim
         for hidden_dim in hidden_dims:
@@ -83,56 +81,28 @@ class _Net(nn.Module):
             prev_dim = hidden_dim
 
         self.out = nn.Linear(prev_dim, output_dim)
-        self.out_act = _get_activation(output_activation)
+        # Store requested output activation for inference only
+        self.out_activation_name = output_activation
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         self.logger.debug(f"Net forward: Input tensor shape: {x.shape}")
-        self.logger.debug(f"Net forward: Activation function: {self.act}")
         if torch.isnan(x).any() or torch.isinf(x).any():
             self.logger.warning("Input tensor contains NaNs or infinite values!")
             raise ValueError(
                 "Input tensor contains NaNs or infinite values, which may cause the hidden layer to return NaNs"
             )
-        if self.logger.isEnabledFor(logging.DEBUG):
-            with open("input_tensor.json", "w") as f:
-                json.dump(x.cpu().numpy().tolist(), f)
-
-        # Forward through all hidden layers
+        # Forward through hidden layers
         for i, hidden_layer in enumerate(self.hidden_layers):
             x = hidden_layer(x)
-            if torch.isnan(x).any():
-                self.logger.warning(f"Hidden layer {i+1} output contains NaNs!")
-                raise ValueError(f"Hidden layer {i+1} output contains NaNs")
-
-            # Apply activation (ReLU for first layer, no activation for second layer per paper)
-            if (
-                i == 0 and self.act is not None
-            ):  # Only apply activation to first hidden layer
+            if i == 0 and self.act is not None:
                 x = self.act(x)
-                self.logger.debug(
-                    f"Net forward: After activation layer {i+1}, tensor shape: {x.shape}"
-                )
-                if torch.isnan(x).any():
-                    self.logger.warning(f"Activation output layer {i+1} contains NaNs!")
-                    raise ValueError(f"Activation output layer {i+1} contains NaNs")
-
-        # Output layer
+        # Return logits (no activation); losses expect logits
         out = self.out(x)
-        if torch.isnan(out).any():
-            self.logger.warning("Output tensor contains NaNs!")
-            raise ValueError("Output tensor contains NaNs")
-
-        if self.out_act is None:
-            return out
-        out = self.out_act(out)
-        if torch.isnan(out).any():
-            self.logger.warning("Output tensor contains NaNs after activation!")
-            raise ValueError("Output tensor contains NaNs after activation")
         return out
 
 
 class _PromissingNet(nn.Module):
-    """MLP network with PROMISSING input layer."""
+    """MLP with PROMISSING first layer; returns logits in forward."""
 
     def __init__(
         self,
@@ -143,44 +113,31 @@ class _PromissingNet(nn.Module):
         output_activation: str = "sigmoid",
     ) -> None:
         super().__init__()
-        # First layer is always PROMISSING
         self.hidden = PromissingLinear(input_dim, hidden_dims[0], bias=True)
         self.act = _get_activation(activation)
-
-        # Build additional hidden layers if more than one specified
         self.additional_hidden_layers = nn.ModuleList()
         prev_dim = hidden_dims[0]
         for hidden_dim in hidden_dims[1:]:
             self.additional_hidden_layers.append(nn.Linear(prev_dim, hidden_dim))
             prev_dim = hidden_dim
-
         self.out = nn.Linear(prev_dim, output_dim, bias=True)
-        self.out_act = _get_activation(output_activation)
+        self.out_activation_name = output_activation
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # First layer (PROMISSING) with optional activation
         x = self.hidden(x)
         if self.act is not None:
             x = self.act(x)
-
-        # Additional hidden layers
         for i, hidden_layer in enumerate(self.additional_hidden_layers):
             x = hidden_layer(x)
-            # Apply activation only to first additional layer (second layer overall)
             if i == 0 and self.act is not None:
                 x = self.act(x)
-
-        # Output layer with optional activation (handle linear)
-        out = self.out(x)
-        if self.out_act is None:
-            return out
-        return self.out_act(out)
+        return self.out(x)  # logits
 
 
 class _mPromissingNet(nn.Module):
-    """MLP with *compensated* PROMISSING layer."""
+    """MLP with mPROMISSING first layer; returns logits in forward."""
 
-    def __init__(
+    def __init(
         self,
         input_dim: int,
         hidden_dims: Tuple[int, ...] = (4,),
@@ -189,87 +146,37 @@ class _mPromissingNet(nn.Module):
         output_activation: str = "sigmoid",
     ) -> None:
         super().__init__()
-        # First layer is always mPROMISSING
         self.hidden = mPromissingLinear(input_dim, hidden_dims[0], bias=True)
         self.act = _get_activation(activation)
-
-        # Build additional hidden layers if more than one specified
         self.additional_hidden_layers = nn.ModuleList()
         prev_dim = hidden_dims[0]
         for hidden_dim in hidden_dims[1:]:
             self.additional_hidden_layers.append(nn.Linear(prev_dim, hidden_dim))
             prev_dim = hidden_dim
-
         self.out = nn.Linear(prev_dim, output_dim, bias=True)
-        self.out_act = _get_activation(output_activation)
+        self.out_activation_name = output_activation
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # First layer (mPROMISSING) with optional activation
         x = self.hidden(x)
         if self.act is not None:
             x = self.act(x)
-
-        # Additional hidden layers
         for i, hidden_layer in enumerate(self.additional_hidden_layers):
             x = hidden_layer(x)
-            # Apply activation only to first additional layer (second layer overall)
             if i == 0 and self.act is not None:
                 x = self.act(x)
-
-        # Output layer with optional activation (handle linear)
-        out = self.out(x)
-        if self.out_act is None:
-            return out
-        return self.out_act(out)
+        return self.out(x)  # logits
 
 
 class MissingEstimator(BaseEstimator):
-    """Implements a missing value estimator.
+    """Estimator supporting different missing-value strategies and neural heads.
 
-    Parameters
-    ----------
-    imputer_name : str, default="none"
-        Name of the imputer to use. Options are:
-        - "none": No imputation, just a custom model.
-        - "custom": Use a custom model provided via `custom_model`.
-        - "zero": Fill missing values with zero.
-        - "mean": Fill missing values with the mean of each feature.
-        - "knn": Use KNN imputation.
-        - "iterative": Use iterative imputation.
-        - "promissing": Use PROMISSING input layer.
-        - "mpromissing": Use mPROMISSING input layer with compensatory weights.
-    custom_model : nn.Module, optional
-        A custom PyTorch model to use when `imputer_name` is "custom".
-        Must be a subclass of `torch.nn.Module`.
-        see compass_net.py for an example.
-        If `imputer_name` is "custom" and no model is provided, an error will be raised.
-    hidden_dims : tuple of int, default=(4,)
-        Dimensions of the hidden layers in the network.
-        This is only used when `imputer_name` is "custom", "promissing", or "mpromissing".
-    output_dim : int, default=1
-        Number of output neurons in the network.
-    activation : str, default="relu"
-        Activation function to use in the hidden layers.
-    output_activation : str, default="auto"
-        Output activation function to use.
-        If "auto", the output activation function will be determined based on the task.
-    lr : float, default=0.1
-        Learning-rate for SGD.
-    epochs : int, default=100
-        Maximum number of epochs to train.
-    batch_size : int, default=10
-        Mini-batch size.
-    seed : int, default=0
-        Random seed for reproducibility.
-    early_stopping : float, default=0.0
-        Fraction (0 < early_stopping < 1) of the training data to hold out as
-        a validation set for early stopping. If 0, no early stopping.
-    patience : int, default=10
-        Number of consecutive epochs without validation-loss improvement
-        tolerated before training is stopped early.
-    verbose : bool, default=False
-        If True, print training progress.
-    """  # noqa: E501
+    Training uses logits-only heads:
+      - Binary: BCEWithLogitsLoss
+      - Multiclass: CrossEntropyLoss
+      - Regression: MSELoss
+
+    Inference applies activations in predict_proba only.
+    """
 
     def __init__(
         self,
@@ -348,36 +255,22 @@ class MissingEstimator(BaseEstimator):
         else:
             X, y = check_X_y(X, y, ensure_all_finite=True)
 
-        # Format labels based on task type
+        # Format labels for internal torch tensors; actual encoding handled elsewhere
         if hasattr(self, "output_activation"):
-            if self.output_activation == "sigmoid":
-                # Binary classification: keep as (n_samples, 1) for BCELoss
-                y = y.astype(np.float32).reshape(-1, 1)
-            elif self.output_activation == "softmax":
-                # Multi-class: keep as 1D for CrossEntropyLoss
+            if self.output_activation == "softmax":
                 y = y.astype(np.int64).flatten()
             else:
-                # Regression: keep as (n_samples, 1) for MSELoss
                 y = y.astype(np.float32).reshape(-1, 1)
         else:
-            # Default behavior during initialization
             y = y.astype(np.float32).reshape(-1, 1)
-
         return X, y
 
     def _ensure_binary_01(self, y: pd.Series | np.ndarray) -> np.ndarray:
-        """
-        Ensure that any two-class target is encoded as {0, 1}.
-        This prevents targets like {1, 2} from breaking BCELoss.
-        """
         s = pd.Series(y).copy()
-        # If not exactly two non-null classes, return as-is
         if s.dropna().nunique() != 2:
             return np.asarray(y)
-        # If categorical, use codes (already 0/1 for two categories)
         if pd.api.types.is_categorical_dtype(s.dtype):
             return s.cat.codes.to_numpy()
-        # If already {0,1}, keep as-is
         non_null = s.dropna()
         try:
             vals = np.sort(pd.unique(non_null).astype(float))
@@ -385,7 +278,6 @@ class MissingEstimator(BaseEstimator):
                 return s.to_numpy()
         except Exception:
             pass
-        # Deterministic mapping via sorted order
         uniq = pd.unique(non_null)
         try:
             ordered = np.sort(uniq)
@@ -465,40 +357,23 @@ class MissingEstimator(BaseEstimator):
             self.batch_size,
         )
 
-        # Check input data
+        # Decide task/activation
         if self.output_activation == "auto":
-            if isinstance(y, np.ndarray):
-                warnings.warn(
-                    "output activation set to 'auto' but y is a numpy array. "
-                    "Assuming regression task."
-                )
-                self.output_activation = "linear"
-
             task = self._get_task_type_of_data(y)
             self.logger.info(f"Determined task type: {task}")
             if task == "binary_classification":
                 self.output_activation = "sigmoid"
-                self.logger.info(
-                    "Setting output activation to 'sigmoid' for binary classification."
-                )
             elif task == "regression":
                 self.output_activation = "linear"
-                self.logger.info(
-                    "Setting output activation to 'linear' for regression."
-                )
             elif task == "multi_class_classification":
                 self.output_activation = "softmax"
-                self.logger.info(
-                    "Setting output activation to 'softmax' for multi-class classification."
-                )
 
-        # Decide whether to split validation first
+        # Early stopping split
         if self.early_stopping and 0.0 < self.early_stopping < 1.0:
-            # Shuffle X and y together
             indices = np.arange(len(X))
             rng = np.random.default_rng(self.random_state)
             rng.shuffle(indices)
-            if isinstance(X, pd.DataFrame) or isinstance(X, pd.Series):
+            if isinstance(X, (pd.DataFrame, pd.Series)):
                 X, y = X.iloc[indices], y.iloc[indices]
                 n_val = max(1, int(len(X) * self.early_stopping))
                 X_val, y_val = X.iloc[:n_val], y.iloc[:n_val]
@@ -509,41 +384,56 @@ class MissingEstimator(BaseEstimator):
                 X_val, y_val = X[:n_val], y[:n_val]
                 X_train, y_train = X[n_val:], y[n_val:]
             has_val = True
-            if self.verbose:
-                self.logger.info(
-                    f"Early-stopping enabled: {n_val} samples for validation."
-                )
         else:
             X_train, y_train = X, y
             has_val = False
 
-        # Normalize binary labels to {0,1} for BCELoss compatibility
+        # Label handling
+        self._classes_encoder = None
         if self.output_activation == "sigmoid":
             y_train = self._ensure_binary_01(y_train)
             if has_val:
                 y_val = self._ensure_binary_01(y_val)
+            self._unique_classes = np.array([0, 1], dtype=int)
+        elif self.output_activation == "softmax":
+            # Map labels to 0..C-1
+            y_series = pd.Series(y_train)
+            classes_sorted = np.array(
+                sorted(pd.unique(y_series.dropna())), dtype=object
+            )
+            class_to_index = {cls: i for i, cls in enumerate(classes_sorted)}
+            y_train = y_series.map(class_to_index).to_numpy()
+            if has_val:
+                y_val = pd.Series(y_val).map(class_to_index).to_numpy()
+            self._classes_encoder = {
+                "classes_": classes_sorted,
+                "to_index": class_to_index,
+            }
+            self._unique_classes = np.arange(len(classes_sorted))
+            # Adjust output_dim to #classes if not set
+            self.output_dim = int(len(classes_sorted))
 
-        # Fit imputer if needed
+        # Impute if needed
         if self.imputer is not None:
             self.imputer.fit(X_train)
             X_train = self.imputer.transform(X_train)
             if has_val:
                 X_val = self.imputer.transform(X_val)
-            self.logger.debug(
-                "Applied imputer '%s' to training%s.",
-                self.imputer_name,
-                " and validation" if has_val else "",
-            )
 
-        # Get input dimension after potential imputation
         input_dim = X_train.shape[1]
 
-        # Build network
+        # If using COMPASS, expand the training (and validation) sets to include
+        # mask patterns so every sub-network is trained. This operates on numpy arrays.
+        if self.imputer_name == "compass":
+            X_train, y_train = compass_expand_patterns(X_train, y_train)
+            if has_val:
+                X_val, y_val = compass_expand_patterns(X_val, y_val)
+
+        # Build model (logits-only forward)
         if self.imputer_name == "custom" and self.custom_model is not None:
             if not isinstance(self.custom_model, nn.Module):
                 raise ValueError("Custom model must be a subclass of nn.Module.")
             self._model_ = self.custom_model.to(device)
-            self.logger.info("Using custom model: %s", type(self.custom_model).__name__)
         elif self.imputer_name == "custom" and self.custom_model is None:
             raise ValueError(
                 "Custom model must be provided when imputer_name is 'custom'."
@@ -557,7 +447,6 @@ class MissingEstimator(BaseEstimator):
                     self.activation,
                     self.output_activation,
                 ).to(device)
-                self.logger.info("Built model: _PromissingNet in_dim=%d", input_dim)
             elif self.imputer_name == "mpromissing":
                 self._model_ = _mPromissingNet(
                     input_dim,
@@ -566,10 +455,26 @@ class MissingEstimator(BaseEstimator):
                     self.activation,
                     self.output_activation,
                 ).to(device)
-                self.logger.info("Built model: _mPromissingNet in_dim=%d", input_dim)
             elif self.imputer_name == "compass":
-                self._model_ = COMPASSNet(input_dim).to(device)
-                self.logger.info("Built model: COMPASSNet in_dim=%d", input_dim)
+                # Build COMPASS with same hidden_dims; heads return logits
+                task = (
+                    "multiclass"
+                    if self.output_activation == "softmax"
+                    else (
+                        "binary"
+                        if self.output_activation == "sigmoid"
+                        else "regression"
+                    )
+                )
+                n_classes = self.output_dim if task == "multiclass" else 2
+                self._model_ = COMPASSNet(
+                    in_features=input_dim,
+                    hidden_dims=self.hidden_dims,
+                    task=task,
+                    n_classes=n_classes,
+                    output_activation=None,  # logits only during training
+                    linear_cls=nn.Linear,
+                ).to(device)
             else:
                 self._model_ = _Net(
                     input_dim,
@@ -578,11 +483,10 @@ class MissingEstimator(BaseEstimator):
                     self.activation,
                     self.output_activation,
                 ).to(device)
-                self.logger.info("Built model: _Net in_dim=%d", input_dim)
 
-        # Select appropriate loss function based on task type
+        # Select loss (expects logits)
         if self.output_activation == "sigmoid":
-            criterion = nn.BCELoss()
+            criterion = nn.BCEWithLogitsLoss()
         elif self.output_activation == "softmax":
             criterion = nn.CrossEntropyLoss()
         else:  # linear/regression
@@ -590,45 +494,18 @@ class MissingEstimator(BaseEstimator):
 
         optimiser = optim.SGD(self._model_.parameters(), lr=self.lr)
 
-        # Check and convert input data
+        # Check and convert to tensors
         X_train, y_train = self._check_X_y(X_train, y_train)
         if has_val:
             X_val, y_val = self._check_X_y(X_val, y_val)
 
-        # Store original labels for classes_ attribute (before tensor conversion)
+        # Data loaders
         if self.output_activation == "softmax":
-            self._unique_classes = np.unique(y_train).astype(int)
-        elif self.output_activation == "sigmoid":
-            self._unique_classes = np.array([0, 1], dtype=int)
-
-        # If using COMPASS, expand the training (and validation) set to include
-        # all mask patterns of size 0, 1, and 2 so every sub-network gets trained.
-        if self.imputer_name == "compass":
-            # Expand the training (and validation) set to include
-            # all mask patterns of size 1 and 2 (and 0 implicitly by including originals),
-            # ensuring alignment between X and y and filtering unusable rows.
-            X_train, y_train = compass_expand_patterns(
-                X_train, y_train
-            )
-            if has_val:
-                X_val, y_val = compass_expand_patterns(
-                    X_val, y_val
-                )
-            self.logger.debug(
-                "Expanded training for COMPASS: X=%s, y=%s",
-                X_train.shape,
-                y_train.shape,
-            )
-
-        # Build data loaders
-        if self.output_activation == "softmax":
-            # Multi-class: y should be 1D LongTensor for CrossEntropyLoss
             train_ds = torch.utils.data.TensorDataset(
                 torch.tensor(X_train, dtype=torch.float32),
                 torch.tensor(y_train, dtype=torch.long),
             )
         else:
-            # Binary classification or regression: y should be FloatTensor
             train_ds = torch.utils.data.TensorDataset(
                 torch.tensor(X_train, dtype=torch.float32),
                 torch.tensor(y_train, dtype=torch.float32),
@@ -662,18 +539,8 @@ class MissingEstimator(BaseEstimator):
             for xb, yb in train_loader:
                 xb, yb = xb.to(device), yb.to(device)
                 optimiser.zero_grad()
-                preds = self._model_(xb)
-                if self.logger.isEnabledFor(logging.DEBUG):
-                    with open(f"last_train_batch.json", "w") as f:
-                        json.dump(
-                            {
-                                "xb": xb.cpu().numpy().tolist(),
-                                "yb": yb.cpu().numpy().tolist(),
-                                "preds": preds.cpu().detach().numpy().tolist(),
-                            },
-                            f,
-                        )
-                loss = criterion(preds, yb)
+                logits = self._model_(xb)
+                loss = criterion(logits, yb)
                 loss.backward()
                 optimiser.step()
                 epoch_loss += loss.item() * len(xb)
@@ -683,12 +550,11 @@ class MissingEstimator(BaseEstimator):
                     f"Epoch {epoch+1:03d}, train loss = {epoch_loss/len(train_ds):.4f}"
                 )
 
-            # Early-stopping evaluation
+            # Early stopping
             if has_val:
                 val_loss = self._evaluate_loss(val_loader, criterion, device)
                 if self.verbose:
                     self.logger.info(f"            val   loss = {val_loss:.4f}")
-                # Check improvement
                 if val_loss < best_val_loss - 1e-6:
                     best_val_loss = val_loss
                     epochs_no_improve = 0
@@ -703,16 +569,13 @@ class MissingEstimator(BaseEstimator):
                             )
                         break
 
-        # Restore best model if early stopping was used
         if has_val and best_state is not None:
             self._model_.load_state_dict(best_state)
 
-        # Set scikit-learn attributes based on task type
+        # scikit-learn attributes
         if self.output_activation in ["sigmoid", "softmax"]:
             self.classes_ = self._unique_classes
-        # No classes_ attribute for regression
-
-        self.n_features_in_ = X.shape[1]
+        self.n_features_in_ = int(input_dim)
         self.logger.info("Fit complete.")
         return self
 
@@ -723,14 +586,13 @@ class MissingEstimator(BaseEstimator):
         criterion: nn.Module,
         device: torch.device,
     ) -> float:
-        """Compute average loss over `loader`."""
         self._model_.eval()
         running = 0.0
         total = 0
         for xb, yb in loader:
             xb, yb = xb.to(device), yb.to(device)
-            preds = self._model_(xb)
-            loss = criterion(preds, yb)
+            logits = self._model_(xb)
+            loss = criterion(logits, yb)
             running += loss.item() * len(xb)
             total += len(xb)
         self._model_.train()
@@ -743,42 +605,30 @@ class MissingEstimator(BaseEstimator):
             raise ValueError(
                 "predict_proba is only available for classification tasks with sigmoid or softmax output activation."
             )
-
         device = self._get_device()
         X = np.asarray(X, dtype=np.float32)
         if self.imputer is not None:
             X = self.imputer.transform(X)
         self._model_.eval()
-        preds = self._model_(torch.tensor(X, dtype=torch.float32).to(device))
-
+        logits = self._model_(torch.tensor(X, dtype=torch.float32).to(device))
         if self.output_activation == "sigmoid":
-            # Binary classification: return probabilities for [class 0, class 1]
-            return np.hstack([1 - preds.cpu().numpy(), preds.cpu().numpy()])
-        else:  # softmax
-            # Multi-class classification: return probabilities for all classes
-            return preds.cpu().numpy()
+            probs_pos = torch.sigmoid(logits).cpu().numpy()
+            return np.hstack([1 - probs_pos, probs_pos])
+        else:
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()
+            return probs
 
-    def _predict_binary(self, X: np.ndarray) -> np.ndarray:
-        probs = self.predict_proba(X)[:, 1]
-        return (probs >= 0.5).astype(int)
-
-    @torch.no_grad()
     def _predict_regression(self, X: np.ndarray) -> np.ndarray:
-        """Predict for regression task."""
         check_is_fitted(self)
         device = self._get_device()
         X = np.asarray(X, dtype=np.float32)
-
         if self.imputer is not None:
             X = self.imputer.transform(X)
-
         self._model_.eval()
         preds = self._model_(torch.tensor(X, dtype=torch.float32).to(device))
-
         return preds.cpu().numpy().flatten()
 
     def _predict_multi_class(self, X: np.ndarray) -> np.ndarray:
-        """Predict for multi-class classification task."""
         check_is_fitted(self)
         device = self._get_device()
         X = np.asarray(X, dtype=np.float32)
@@ -786,77 +636,30 @@ class MissingEstimator(BaseEstimator):
             X = self.imputer.transform(X)
         self._model_.eval()
         with torch.no_grad():
-            preds = self._model_(torch.tensor(X, dtype=torch.float32).to(device))
-            return torch.argmax(preds, dim=1).cpu().numpy()
+            logits = self._model_(torch.tensor(X, dtype=torch.float32).to(device))
+            preds_idx = torch.argmax(logits, dim=1).cpu().numpy()
+            # Map back to original labels if encoder exists
+            if getattr(self, "_classes_encoder", None) is not None:
+                classes = self._classes_encoder["classes_"]
+                return classes[preds_idx]
+            return preds_idx
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """
-        Make predictions based on the task type.
-
-        Parameters
-        ----------
-        X : np.ndarray
-            Input features.
-
-        Returns
-        -------
-        np.ndarray
-            Predictions. For classification tasks, returns class labels.
-            For regression tasks, returns continuous values.
-        """
         check_is_fitted(self)
-
         if self.output_activation == "sigmoid":
-            # Binary classification
             probs = self.predict_proba(X)[:, 1]
             return (probs >= 0.5).astype(int)
         elif self.output_activation == "softmax":
-            # Multi-class classification
-            probs = self.predict_proba(X)
-            return np.argmax(probs, axis=1)
+            return self._predict_multi_class(X)
         else:
-            # Regression
             return self._predict_regression(X)
 
     def score(self, X: np.ndarray, y: np.ndarray) -> dict:
-        """
-        Compute scores for the model based on the task type.
-
-        Parameters
-        ----------
-        X : np.ndarray
-            Input features.
-        y : np.ndarray
-            True labels.
-
-        Returns
-        -------
-        dict
-            Dictionary containing scores for each scoring method based on task type.
-            For binary classification: accuracy, precision, recall, f1, roc_auc
-            For multi-class classification: accuracy, precision_macro, recall_macro, f1_macro
-            For regression: r2, mse, mae
-        """
-
         check_is_fitted(self)
-
-        # Determine task type
-        task_type = "regression"  # default
-        if hasattr(self, "output_activation"):
-            if self.output_activation == "sigmoid":
-                task_type = "binary_classification"
-            elif self.output_activation == "softmax":
-                task_type = "multi_class_classification"
-            elif self.output_activation in ["linear", "relu", "identity"]:
-                task_type = "regression"
-
-        if task_type == "binary_classification":
-            # Normalize ground-truth labels to {0,1}
+        if self.output_activation == "sigmoid":
             y_true = self._ensure_binary_01(y)
-            # Get predictions and probabilities
             y_pred = self.predict(X)
-            y_proba = self.predict_proba(X)[:, 1]  # Probability of positive class
-
+            y_proba = self.predict_proba(X)[:, 1]
             scores = {
                 "accuracy": accuracy_score(y_true, y_pred),
                 "precision": precision_score(
@@ -867,17 +670,14 @@ class MissingEstimator(BaseEstimator):
                 ),
                 "f1": f1_score(y_true, y_pred, average="binary", zero_division=0),
             }
-
-            # Add ROC AUC if we have both classes in y
             if len(np.unique(y_true)) > 1:
                 scores["roc_auc"] = roc_auc_score(y_true, y_proba)
             else:
                 scores["roc_auc"] = 0.0
-
-        elif task_type == "multi_class_classification":
+            return scores
+        elif self.output_activation == "softmax":
             y_pred = self.predict(X)
-
-            scores = {
+            return {
                 "accuracy": accuracy_score(y, y_pred),
                 "precision_macro": precision_score(
                     y, y_pred, average="macro", zero_division=0
@@ -887,14 +687,10 @@ class MissingEstimator(BaseEstimator):
                 ),
                 "f1_macro": f1_score(y, y_pred, average="macro", zero_division=0),
             }
-
-        else:  # regression
-            y_pred = self.predict(X)
-            self.logger.debug(f"Regression predictions: {y_pred}")
-            scores = {
+        else:
+            y_pred = self._predict_regression(X)
+            return {
                 "r2": r2_score(y, y_pred),
                 "mse": mean_squared_error(y, y_pred),
                 "mae": mean_absolute_error(y, y_pred),
             }
-
-        return scores

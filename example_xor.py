@@ -29,17 +29,17 @@ def run_xor_experiments():
     ACTIVATION = "tanh"
     OUTPUT_ACTIVATION = "sigmoid"
     HIDDEN_DIMS = (4,)
-    EARLY_STOPPING = 0.1
-    PATIENCE = 50
+    EARLY_STOPPING = 0.0
+    PATIENCE = 10
 
     MECHANISMS: List[str] = ["MCAR", "MAR", "MNAR"]
     FRACTIONS: List[float] = [0.30, 0.50]  # filenames will be 0.30, 0.50
 
     REQUESTED_IMPUTERS = [
-        "zero",
+        # "zero",
         "mean",
-        "knn",
-        "iterative",
+        # "knn",
+        # "iterative",
         "promissing",
         "mpromissing",
         "compass",

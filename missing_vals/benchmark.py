@@ -143,8 +143,7 @@ def run_missing_benchmark(
 
             except Exception as e:
                 logger.warning(
-                    "Skipping baseline for imputer='%s' on run=%d due to error: %s",
-                    imp,
+                    "Skipping baseline on run=%d due to error: %s",
                     run,
                     e,
                 )
