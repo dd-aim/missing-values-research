@@ -132,7 +132,8 @@ def run_openml_experiment(
     *,
     n_runs: int = 3,
     mechanisms: list[str] = ["MCAR", "MAR", "MNAR"],
-    fractions: list[float] = [0.10, 0.25, 0.50, 0.90],
+    # fractions: list[float] = [0.10, 0.25, 0.50, 0.90],
+    fractions: list[float] = [0.25],
 ) -> None:
     """
     Run dataset-wise OpenML benchmarks using the centralized benchmark helper.
@@ -158,10 +159,10 @@ def run_openml_experiment(
         raise ValueError("regression_datasets must be a dict[str, int]")
 
     REQUESTED_IMPUTERS = [
-        "zero",
+        # "zero",
         "mean",
-        "knn",
-        "iterative",
+        # "knn",
+        # "iterative",
         "promissing",
         "mpromissing",
         "compass",
@@ -173,7 +174,7 @@ def run_openml_experiment(
     LR = 0.01
     ACTIVATION = "relu"
     EARLY_STOPPING = 0.1
-    PATIENCE = 50
+    PATIENCE = 10
 
     # Seeds for reproducibility (used to choose base split; run_missing_benchmark varies per run)
     base_seed = 0

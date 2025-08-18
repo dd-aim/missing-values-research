@@ -137,7 +137,7 @@ class _PromissingNet(nn.Module):
 class _mPromissingNet(nn.Module):
     """MLP with mPROMISSING first layer; returns logits in forward."""
 
-    def __init(
+    def __init__(
         self,
         input_dim: int,
         hidden_dims: Tuple[int, ...] = (4,),
@@ -617,7 +617,8 @@ class MissingEstimator(BaseEstimator):
         else:
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
             return probs
-
+        
+    @torch.no_grad()
     def _predict_regression(self, X: np.ndarray) -> np.ndarray:
         check_is_fitted(self)
         device = self._get_device()
@@ -626,8 +627,9 @@ class MissingEstimator(BaseEstimator):
             X = self.imputer.transform(X)
         self._model_.eval()
         preds = self._model_(torch.tensor(X, dtype=torch.float32).to(device))
-        return preds.cpu().numpy().flatten()
+        return preds.detach().cpu().numpy().flatten()
 
+    @torch.no_grad()
     def _predict_multi_class(self, X: np.ndarray) -> np.ndarray:
         check_is_fitted(self)
         device = self._get_device()
